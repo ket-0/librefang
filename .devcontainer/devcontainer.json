@@ -9,6 +9,7 @@
       "version": "20"
     }
   },
+  "updateContentCommand": "sudo sed -i 's/deb.debian.org/archive.debian.org/g' /etc/apt/sources.list && sudo sed -i 's/security.debian.org/archive.debian.org/g' /etc/apt/sources.list && sudo sed -i '/debian-security/d' /etc/apt/sources.list && sudo apt-get update -o Acquire::Check-Valid-Until=false && sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libdbus-1-dev libglib2.0-dev libgtk-3-dev libsoup2.4-dev libjavascriptcoregtk-4.0-dev libwebkit2gtk-4.0-dev",
   "postCreateCommand": "bash -o pipefail -c \"cargo build --workspace 2>&1 | tail -5 && echo '✅ Build complete!'\"",
   "customizations": {
     "vscode": {
@@ -34,6 +35,9 @@
     }
   },
   "remoteEnv": {
+    "PKG_CONFIG_PATH": "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig",
+    "PKG_CONFIG_ALLOW_SYSTEM_LIBS": "1",
+    "PKG_CONFIG_ALLOW_SYSTEM_CFLAGS": "1",
     "RUST_LOG": "info",
     "RUST_BACKTRACE": "1"
   }
