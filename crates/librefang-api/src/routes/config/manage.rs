@@ -252,6 +252,7 @@ fn redacted_config_json(
         "vector_store_url": config.memory.vector_store_url,
         "soft_delete_retention_days": config.memory.soft_delete_retention_days,
         "pool_size": config.memory.pool_size,
+        "max_episodic_chars": config.memory.max_episodic_chars,
     });
 
     // ── Proactive Memory ──
@@ -271,6 +272,8 @@ fn redacted_config_json(
         "update_threshold_same_category": config.proactive_memory.update_threshold_same_category,
         "update_threshold_cross_category": config.proactive_memory.update_threshold_cross_category,
         "extractor_sidecar": serde_json::to_value(&config.proactive_memory.extractor_sidecar).unwrap_or_default(),
+        "session_scoped_recall": config.proactive_memory.session_scoped_recall,
+        "min_similarity": config.proactive_memory.min_similarity,
     });
 
     // ── Auto-Dream (background memory consolidation) ──
@@ -369,7 +372,11 @@ fn redacted_config_json(
         "audio_model": config.media.audio_model,
         "audio_language": config.media.audio_language,
         "audio_prompt": config.media.audio_prompt,
+        "video_provider": config.media.video_provider,
+        "video_model": config.media.video_model,
         "custom_stt": serde_json::to_value(&config.media.custom_stt).unwrap_or_default(),
+        "custom_image": serde_json::to_value(&config.media.custom_image).unwrap_or_default(),
+        "custom_video": serde_json::to_value(&config.media.custom_video).unwrap_or_default(),
         "stt_available": stt_available,
     });
 
@@ -567,7 +574,11 @@ fn redacted_config_json(
         "token_expiry_secs": config.pairing.token_expiry_secs,
         "public_base_url": config.pairing.public_base_url,
         "push_provider": config.pairing.push_provider,
-        "ntfy_url": config.pairing.ntfy_url,
+        "ntfy_url": config
+            .pairing
+            .ntfy_url
+            .as_deref()
+            .map(redact_url_credentials),
         "ntfy_topic": config.pairing.ntfy_topic,
     });
 
@@ -579,6 +590,11 @@ fn redacted_config_json(
             Some(t) => serde_json::json!({
                 "budget_tokens": t.budget_tokens,
                 "stream_thinking": t.stream_thinking,
+                // #7946. Serialized through `ReasoningMode`'s serde form, not
+                // `Debug`, so the dashboard receives one of the values its
+                // dropdown offers — see
+                // `enum_valued_fields_use_the_serde_encoding_not_debug`.
+                "reasoning_mode": t.reasoning_mode,
             }),
             None => serde_json::json!(null),
         },
@@ -645,6 +661,10 @@ fn redacted_config_json(
         );
     }
 
+    set!("usage", {
+        "retention_days": config.usage.retention_days,
+    });
+
     set!("external_auth", {
         "enabled": config.external_auth.enabled,
         "issuer_url": config.external_auth.issuer_url,
@@ -680,6 +700,24 @@ fn redacted_config_json(
         ea.insert(
             "require_email_verified".into(),
             serde_json::json!(config.external_auth.require_email_verified),
+        );
+        // Read-only for the same reason as `require_email_verified`, and readable for the same reason too (#7744).
+        // `role_map` is what turns a signed ID token into an API credential, so a caller who could write it could grant themselves Owner by naming a claim they already hold; it stays out of the writable sets.
+        // Reading it back is how an operator confirms which IdP groups currently carry privilege — the values are group names the operator chose, never secrets.
+        ea.insert(
+            "role_map".into(),
+            serde_json::json!(config.external_auth.role_map),
+        );
+        // #7746: read-only and readable for exactly the same pair of reasons.
+        // `group_map` decides which local `[[groups]]` an IdP claim confers, and a group confers ownership and the role strings channel binding matches on, so a caller who could write it could join themselves to any team; `claim_paths` decides *where* the claim values both maps are matched against come from, and pointing it at an attacker-controlled claim would be the same escalation one level up.
+        // Both are group and claim names an operator chose, never secrets, and reading them back is how an operator confirms which IdP groups currently confer membership and which part of the token is being trusted.
+        ea.insert(
+            "group_map".into(),
+            serde_json::json!(config.external_auth.group_map),
+        );
+        ea.insert(
+            "claim_paths".into(),
+            serde_json::json!(config.external_auth.claim_paths),
         );
     }
 
@@ -1074,7 +1112,7 @@ pub async fn config_reload(
 pub async fn export_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     use axum::body::Body;
 
-    let config_path = state.kernel.home_dir().join("config.toml");
+    let config_path = state.kernel.config_path().to_path_buf();
 
     let toml_content = match tokio::fs::read_to_string(&config_path).await {
         Ok(content) => content,
@@ -1142,8 +1180,11 @@ pub async fn export_config(State(state): State<Arc<AppState>>) -> impl IntoRespo
         (status = 200, description = "Configuration provenance and writability", body = crate::types::JsonObject)
     )
 )]
-pub async fn config_status() -> impl IntoResponse {
-    axum::Json(librefang_kernel::config::config_provenance(None))
+pub async fn config_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // The kernel's resolved path, not a second resolution: `source` is the file an operator will go and edit, and a status endpoint that names a different one is worse than no status endpoint (#6695).
+    axum::Json(librefang_kernel::config::config_provenance(Some(
+        state.kernel.config_path(),
+    )))
 }
 
 /// GET /api/config/schema — Return a simplified JSON description of the config structure.
@@ -1263,6 +1304,26 @@ fn non_writable_schema_paths(root: &serde_json::Value) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Config Set endpoint
 // ---------------------------------------------------------------------------
+/// Make `item` addressable as a table, creating a standard table only when it
+/// is not already table-shaped.
+///
+/// The distinction matters because `toml_edit` models `[media]` and
+/// `media = { … }` as different `Item` variants — `Item::Table` and
+/// `Item::Value(Value::InlineTable)` — while `contains_table` / `as_table_mut`
+/// recognise only the former. The previous `if !doc.contains_table(name)` guard
+/// therefore judged a hand-written inline section "missing" and replaced it
+/// with an empty table, dropping every key it held, `api_key_env` included.
+///
+/// A caller editing one leaf of such a section would have silently deleted the
+/// rest of it — and #8085 recommends exactly those per-leaf writes as the safe
+/// route for tables carrying credential fields, which is what makes this
+/// reachable rather than theoretical.
+fn ensure_table_like(item: &mut toml_edit::Item) {
+    if !item.is_table_like() {
+        *item = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+}
+
 /// POST /api/config/set — Set a single config value and persist to config.toml.
 ///
 /// Accepts JSON `{ "path": "section.key", "value": "..." }`.
@@ -1371,21 +1432,34 @@ pub async fn config_set(
         );
     }
 
-    let config_path = state.kernel.home_dir().join("config.toml");
-    // Block path-traversal (`..`) but allow Windows drive-letter prefixes
-    if config_path.file_name().and_then(|n| n.to_str()) != Some("config.toml")
-        || config_path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    // SECURITY (#8085): the path check above governs only the name being
+    // assigned. A write one level below a writable section assigns the
+    // submitted JSON wholesale, so an innocuous-looking path can carry a
+    // scrubbed field as a member of the table it replaces — the
+    // `{"path": "media.custom_stt", "value": {"api_key_env": "..."}}` shape.
+    // Scan the payload for the same key names the path check refuses, so a
+    // credential-shaped field is unreachable by either route.
+    if let Some(offending) = super::scrubbed_key_in_payload(&value) {
         return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"status":"error","error":"invalid config file path"})),
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": format!(
+                    "value posted to '{path}' contains '{offending}', which is not \
+                     user-tunable via /api/config/set; post the other fields \
+                     individually (e.g. '{path}.<field>') and edit \
+                     '{offending}' in ~/.librefang/config.toml directly"
+                )
+            })),
         );
     }
 
+    // No basename / traversal check on `config_path`: it is the kernel's boot-resolved path, not anything the request supplied.
+    // Under `LIBREFANG_CONFIG_PATH` the operator's chosen filename is the point, so rejecting a name that is not literally `config.toml` would refuse to write the very file this daemon loaded (#6695).
+    let config_path = state.kernel.config_path().to_path_buf();
+
     // Serialize concurrent writes to prevent read-modify-write races
-    if let Some(locked) = crate::routes::guard_config_write() {
+    if let Some(locked) = crate::routes::guard_config_write(state.kernel.config_path()) {
         return locked;
     }
     let _config_guard = state.config_write_lock.lock().await;
@@ -1445,32 +1519,32 @@ pub async fn config_set(
         }
         2 => {
             if is_remove {
-                if let Some(t) = doc[parts[0]].as_table_mut() {
+                // `as_table_like_mut` rather than `as_table_mut`: a section an
+                // operator hand-wrote as an inline table (`media = { … }`) is
+                // `Item::Value(InlineTable)`, not `Item::Table`, and the
+                // narrower accessor returns `None` — so the removal silently
+                // did nothing while the handler still answered success.
+                if let Some(t) = doc[parts[0]].as_table_like_mut() {
                     t.remove(parts[1]);
                 }
             } else {
-                if !doc.contains_table(parts[0]) {
-                    doc[parts[0]] = toml_edit::Item::Table(toml_edit::Table::new());
-                }
+                ensure_table_like(&mut doc[parts[0]]);
                 doc[parts[0]][parts[1]] = toml_edit::Item::Value(json_to_toml_edit_value(&value));
             }
         }
         3 => {
             if is_remove {
-                if let Some(t) = doc[parts[0]].as_table_mut() {
-                    if let Some(t2) = t.get_mut(parts[1]).and_then(|i| i.as_table_mut()) {
+                if let Some(t) = doc[parts[0]].as_table_like_mut() {
+                    if let Some(t2) = t.get_mut(parts[1]).and_then(|i| i.as_table_like_mut()) {
                         t2.remove(parts[2]);
                     }
                 }
             } else {
-                if !doc.contains_table(parts[0]) {
-                    doc[parts[0]] = toml_edit::Item::Table(toml_edit::Table::new());
-                }
-                if !doc[parts[0]]
-                    .as_table()
-                    .is_some_and(|t| t.contains_table(parts[1]))
-                {
-                    doc[parts[0]][parts[1]] = toml_edit::Item::Table(toml_edit::Table::new());
+                ensure_table_like(&mut doc[parts[0]]);
+                if let Some(section) = doc[parts[0]].as_table_like_mut() {
+                    if !section.get(parts[1]).is_some_and(|i| i.is_table_like()) {
+                        section.insert(parts[1], toml_edit::Item::Table(toml_edit::Table::new()));
+                    }
                 }
                 doc[parts[0]][parts[1]][parts[2]] =
                     toml_edit::Item::Value(json_to_toml_edit_value(&value));
@@ -1745,6 +1819,41 @@ mod config_read_write_parity_tests {
                 "`{path}` must be the serde encoding the write path accepts, not Debug's \
                  variant name"
             );
+        }
+    }
+
+    #[test]
+    fn pairing_ntfy_url_hides_embedded_credentials() {
+        let mut config = KernelConfig::default();
+        config.pairing.ntfy_url =
+            Some("https://notify-user:notify-password@ntfy.example.test/topic".to_string());
+
+        let payload = super::redacted_config_json(&config, &BudgetConfig::default());
+        let rendered = lookup(&payload, "pairing.ntfy_url")
+            .and_then(|value| value.as_str())
+            .expect("configured ntfy URL remains visible in redacted form");
+
+        assert_eq!(rendered, "https://***@ntfy.example.test/topic");
+        assert!(!rendered.contains("notify-user"));
+        assert!(!rendered.contains("notify-password"));
+    }
+
+    #[test]
+    fn pairing_ntfy_url_preserves_at_signs_outside_the_authority() {
+        for url in [
+            "https://ntfy.example.test/topic@tenant",
+            "https://ntfy.example.test/topic?contact=ops@example.test",
+            "https://ntfy.example.test/topic#owner@tenant",
+        ] {
+            let mut config = KernelConfig::default();
+            config.pairing.ntfy_url = Some(url.to_string());
+
+            let payload = super::redacted_config_json(&config, &BudgetConfig::default());
+            let rendered = lookup(&payload, "pairing.ntfy_url")
+                .and_then(|value| value.as_str())
+                .expect("configured ntfy URL remains visible");
+
+            assert_eq!(rendered, url);
         }
     }
 

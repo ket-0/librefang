@@ -8,11 +8,11 @@ use crate::rate_limit_tracker::RateLimitSnapshot;
 use crate::think_filter::{FilterAction, StreamingThinkFilter};
 use async_trait::async_trait;
 use futures::StreamExt;
-use librefang_types::config::ResponseFormat;
+use librefang_types::config::{ReasoningMode, ResponseFormat};
 use librefang_types::message::{ContentBlock, MessageContent, Role, StopReason, TokenUsage};
 use librefang_types::tool::ToolCall;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
@@ -20,6 +20,19 @@ use zeroize::Zeroizing;
 /// The accumulator is grown densely up to the `index` reported in each SSE delta, and this driver talks to arbitrary user-configured base URLs (Ollama, LiteLLM, custom gateways), so a hostile or buggy endpoint could send an enormous `index` and OOM the daemon.
 /// No real response carries anywhere near this many parallel tool calls.
 const MAX_STREAMED_TOOL_CALLS: usize = 256;
+
+#[derive(Default)]
+struct StreamedToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+    start_emitted: bool,
+    arguments_emitted: usize,
+}
+
+type MoonshotUploadLock = tokio::sync::Mutex<()>;
+type MoonshotUploadLocks =
+    std::sync::Arc<tokio::sync::Mutex<HashMap<[u8; 32], std::sync::Weak<MoonshotUploadLock>>>>;
 
 /// OpenAI-compatible API driver.
 pub struct OpenAIDriver {
@@ -36,6 +49,9 @@ pub struct OpenAIDriver {
     /// Cache of uploaded file IDs for Moonshot/Kimi (hash of bytes → file_id).
     /// Avoids re-uploading the same file across agent loop iterations.
     moonshot_file_cache: std::sync::Arc<tokio::sync::Mutex<HashMap<[u8; 32], String>>>,
+    /// Per-content single-flight locks for Moonshot uploads.
+    /// Weak values avoid retaining one lock forever for every file ever seen.
+    moonshot_upload_locks: MoonshotUploadLocks,
     /// Per-provider HTTP request timeout in seconds.
     /// Overrides the HTTP client's default read timeout when set.
     request_timeout_secs: Option<u64>,
@@ -49,6 +65,14 @@ pub struct OpenAIDriver {
     /// after the first try, so the request is issued at most `max_retries + 1`
     /// times. Sourced from `DriverConfig.max_retries` (default 3).
     max_retries: u32,
+    /// Models this endpoint has rejected `reasoning_effort` for (#7769).
+    ///
+    /// Whether a model can reason and whether the gateway in front of it will forward the field are different questions, and only the second decides the outcome — litellm strips the parameter and 400s before the model ever sees it, and the error names the adapter rather than the model.
+    /// No static table answers that, so the driver discovers it: the first rejection strips the field and retries, and the model is recorded here so `build_request` omits it from then on instead of spending a round trip per turn re-learning the same answer.
+    ///
+    /// Keyed by model alone because one driver instance is one `base_url`, so the provider half of the pair is already fixed.
+    /// Deliberately per-instance and in-memory: a gateway's model group can be reconfigured to accept the field, and a persisted negative cache would keep suppressing it long after that.
+    reasoning_effort_unsupported: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
 }
 
 impl OpenAIDriver {
@@ -88,9 +112,11 @@ impl OpenAIDriver {
             use_api_key_header: false,
             url_query: None,
             moonshot_file_cache: Default::default(),
+            moonshot_upload_locks: Default::default(),
             request_timeout_secs,
             emit_caller_trace_headers: true,
             max_retries: 3,
+            reasoning_effort_unsupported: Default::default(),
         }
     }
 
@@ -134,10 +160,30 @@ impl OpenAIDriver {
             use_api_key_header: true,
             url_query: Some(format!("api-version={}", api_version)),
             moonshot_file_cache: Default::default(),
+            moonshot_upload_locks: Default::default(),
             request_timeout_secs: None,
             emit_caller_trace_headers: true,
             max_retries: 3,
+            reasoning_effort_unsupported: Default::default(),
         }
+    }
+
+    /// Whether this endpoint has already rejected `reasoning_effort` for `model`.
+    ///
+    /// A poisoned lock is recovered rather than propagated: the set is an optimisation, and panicking a live agent turn over it would trade a wasted round trip for a lost turn.
+    fn reasoning_effort_rejected(&self, model: &str) -> bool {
+        self.reasoning_effort_unsupported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(model)
+    }
+
+    /// Record that this endpoint rejected `reasoning_effort` for `model`.
+    fn record_reasoning_effort_rejected(&self, model: &str) {
+        self.reasoning_effort_unsupported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(model.to_string());
     }
 
     /// True if this provider is Moonshot/Kimi and requires reasoning_content on assistant messages with tool_calls.
@@ -148,6 +194,21 @@ impl OpenAIDriver {
     /// True if the base URL points to Moonshot/Kimi.
     fn is_moonshot(&self) -> bool {
         self.base_url.contains("moonshot")
+    }
+
+    /// Which reasoning dialect this endpoint speaks (#7946).
+    ///
+    /// Decided from `base_url` rather than the model id, because the routing —
+    /// not the model — is what determines whether the nested
+    /// `reasoning: {"effort": …}` form or top-level `reasoning_effort` is
+    /// accepted. `openrouter/deepseek/deepseek-v4-pro` and a direct
+    /// `deepseek-v4-pro` are the same model behind two different dialects.
+    fn reasoning_wire_family(&self) -> ReasoningWireFamily {
+        if self.base_url.to_ascii_lowercase().contains("openrouter") {
+            ReasoningWireFamily::OpenRouter
+        } else {
+            ReasoningWireFamily::Direct
+        }
     }
 
     /// Stable provider tag used by [`crate::shared_rate_guard`].
@@ -234,6 +295,85 @@ impl OpenAIDriver {
             .ok_or_else(|| LlmError::Http(format!("Moonshot file upload: missing 'id' in {body}")))
     }
 
+    /// Return the cached Moonshot file ID or upload it exactly once per content
+    /// hash while concurrent callers wait on the same per-hash lock.
+    async fn upload_file_to_moonshot_cached(
+        &self,
+        hash: [u8; 32],
+        data: &[u8],
+        filename: &str,
+        mime: &str,
+    ) -> Result<String, LlmError> {
+        if let Some(id) = self.moonshot_file_cache.lock().await.get(&hash).cloned() {
+            return Ok(id);
+        }
+
+        let upload_lock = {
+            let mut locks = self.moonshot_upload_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&hash).and_then(std::sync::Weak::upgrade) {
+                lock
+            } else {
+                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(hash, std::sync::Arc::downgrade(&lock));
+                lock
+            }
+        };
+
+        let _upload_guard = upload_lock.lock().await;
+        if let Some(id) = self.moonshot_file_cache.lock().await.get(&hash).cloned() {
+            return Ok(id);
+        }
+
+        let id = self.upload_file_to_moonshot(data, filename, mime).await?;
+        debug!(file_id = %id, filename = %filename, "Uploaded file to Moonshot");
+
+        let mut cache = self.moonshot_file_cache.lock().await;
+        // The cache is only a deduplication optimization. A full eviction is
+        // acceptable: a later miss merely uploads the content again.
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(hash, id.clone());
+        Ok(id)
+    }
+
+    /// Resolve local `ImageFile` blocks asynchronously before the synchronous
+    /// request-shape builder runs. Missing files retain the historical
+    /// warn-and-skip behavior.
+    async fn preprocess_image_files(&self, request: &mut CompletionRequest) {
+        use base64::Engine;
+
+        let messages = std::sync::Arc::make_mut(&mut request.messages);
+        for message in messages {
+            let MessageContent::Blocks(blocks) = &mut message.content else {
+                continue;
+            };
+            let mut index = 0;
+            while index < blocks.len() {
+                let ContentBlock::ImageFile { media_type, path } = &blocks[index] else {
+                    index += 1;
+                    continue;
+                };
+                let media_type = media_type.clone();
+                let path = path.clone();
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => {
+                        blocks[index] = ContentBlock::Image {
+                            media_type,
+                            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        };
+                        index += 1;
+                    }
+                    Err(error) => {
+                        warn!(path = %path, %error, "ImageFile missing, skipping");
+                        blocks.remove(index);
+                    }
+                }
+            }
+        }
+    }
+
     /// Pre-process a CompletionRequest for Moonshot: upload non-image files and
     /// replace eligible ContentBlock::Image/ImageFile with a text marker that
     /// `build_request()` converts to `OaiContentPart::File`.
@@ -318,30 +458,9 @@ impl OpenAIDriver {
                 // Hash full file content with SHA-256 for cache key
                 let hash: [u8; 32] = Sha256::digest(&bytes).into();
 
-                // Short lock: check cache only, release before any network I/O
-                let cached = {
-                    let cache = self.moonshot_file_cache.lock().await;
-                    cache.get(&hash).cloned()
-                };
-
-                let file_id = if let Some(id) = cached {
-                    id
-                } else {
-                    let id = self
-                        .upload_file_to_moonshot(&bytes, &filename, &mime)
-                        .await?;
-                    debug!(file_id = %id, filename = %filename, "Uploaded file to Moonshot");
-                    // Short lock: insert result into cache
-                    let mut cache = self.moonshot_file_cache.lock().await;
-                    // Cap at 256 entries — full eviction (not true LRU) is acceptable
-                    // because the cache is only a dedup optimisation; stale entries just
-                    // trigger a re-upload which Moonshot handles idempotently.
-                    if cache.len() >= 256 {
-                        cache.clear();
-                    }
-                    cache.insert(hash, id.clone());
-                    id
-                };
+                let file_id = self
+                    .upload_file_to_moonshot_cached(hash, &bytes, &filename, &mime)
+                    .await?;
 
                 // Replace the block with a text marker
                 blocks[i] = ContentBlock::Text {
@@ -522,8 +641,18 @@ struct OaiRequest {
     /// OpenAI-style extended-thinking opt-in, derived from `CompletionRequest.thinking` (#6398).
     /// Many OpenAI-compatible gateways gate reasoning behind this parameter and map it to a thinking budget server-side; without it they never produce the `reasoning_content` deltas the stream path already parses.
     /// An explicit `extra_body.reasoning_effort` overrides this value in `merge_extra_body`.
+    ///
+    /// Mutually exclusive with [`Self::reasoning`] — see [`reasoning_wire_fields`].
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
+    /// OpenRouter's nested reasoning control, `{"effort": "..."}` (#7946).
+    ///
+    /// OpenRouter answers HTTP 400 to a body that carries both this and the
+    /// top-level `reasoning_effort`, so exactly one of the two is ever
+    /// populated. [`reasoning_wire_fields`] is the single place that decides
+    /// which, and `no_payload_ever_carries_both_reasoning_controls` pins it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<serde_json::Value>,
     /// Structured output: `response_format` field (json_object or json_schema).
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<serde_json::Value>,
@@ -558,6 +687,25 @@ fn merge_extra_body(
         for k in keys {
             obj.insert(k.clone(), extra[k].clone());
         }
+        // #7946: `reasoning_effort` and `reasoning` are mutually exclusive on
+        // the wire — OpenRouter answers HTTP 400 to a payload carrying both.
+        // `reasoning_wire_fields` already guarantees that invariant for its
+        // own output, but an extra_body override of one spelling must also
+        // clear whichever spelling it resolved to, or the two can still
+        // coexist on an OpenRouter-routed request.
+        // Each guard also requires the *other* spelling to be absent from
+        // `extra`: an operator who deliberately supplied both has overridden
+        // both, and removing each because the other is present would leave the
+        // body with neither — silently dropping the reasoning control instead
+        // of honouring what was asked for.
+        let extra_effort = extra.contains_key("reasoning_effort");
+        let extra_nested = extra.contains_key("reasoning");
+        if extra_effort && !extra_nested {
+            obj.remove("reasoning");
+        }
+        if extra_nested && !extra_effort {
+            obj.remove("reasoning_effort");
+        }
     }
 }
 
@@ -572,6 +720,167 @@ fn reasoning_effort_for_budget(budget_tokens: u32) -> Option<&'static str> {
         4097..=16384 => Some("medium"),
         _ => Some("high"),
     }
+}
+
+/// Which reasoning dialect the endpoint in front of the model speaks (#7946).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningWireFamily {
+    /// The provider's own OpenAI-compatible endpoint.
+    Direct,
+    /// An OpenRouter gateway.
+    OpenRouter,
+}
+
+/// The reasoning-related fields of one outbound OpenAI-compatible body.
+///
+/// Returned as a group rather than resolved field-by-field at the struct
+/// literal because the interesting property is a relationship *between* the
+/// fields — `reasoning_effort` and `reasoning` must never both be populated —
+/// and a relationship can only be enforced where both values are in hand.
+#[derive(Debug, Default, PartialEq)]
+struct ReasoningWireFields {
+    /// DeepSeek / Moonshot gate: `{"type": "enabled" | "disabled"}`.
+    thinking: Option<serde_json::Value>,
+    /// Top-level OpenAI-style grade.
+    reasoning_effort: Option<&'static str>,
+    /// OpenRouter's nested grade, `{"effort": "..."}`.
+    reasoning: Option<serde_json::Value>,
+}
+
+/// DeepSeek V4's `reasoning_effort` vocabulary.
+///
+/// `None` means "no effort field" — the caller disables thinking instead.
+/// V4 accepts `low` / `high` / `max` and folds the compatibility spellings
+/// `medium` and `xhigh` into `high`, so nothing here needs to emit those.
+fn deepseek_reasoning_effort(mode: ReasoningMode) -> Option<&'static str> {
+    match mode {
+        ReasoningMode::None => None,
+        ReasoningMode::Low => Some("low"),
+        ReasoningMode::High => Some("high"),
+        ReasoningMode::Max => Some("max"),
+    }
+}
+
+/// OpenRouter's `reasoning.effort` vocabulary.
+///
+/// Total, because OpenRouter accepts `none` as an effort value and therefore
+/// needs no separate gate field to express non-think.
+/// `max` becomes `xhigh`, OpenRouter's name for the same rung.
+fn openrouter_reasoning_effort(mode: ReasoningMode) -> &'static str {
+    match mode {
+        ReasoningMode::None => "none",
+        ReasoningMode::Low => "low",
+        ReasoningMode::High => "high",
+        ReasoningMode::Max => "xhigh",
+    }
+}
+
+/// The `reasoning_effort` vocabulary of a generic OpenAI-compatible endpoint.
+///
+/// `None` means "omit the field", which is the only portable way to ask a
+/// generic gateway not to reason: OpenAI itself answers 400 to
+/// `reasoning_effort: "none"`, and a gateway that reasons by default is
+/// exactly the case that has its own gate field (DeepSeek V4, Kimi) handled
+/// elsewhere.
+/// `max` is clamped to `high` for the same reason — the OpenAI schema has no
+/// rung above it, and inventing one buys a 400 plus a strip-and-retry.
+fn generic_reasoning_effort(mode: ReasoningMode) -> Option<&'static str> {
+    match mode {
+        ReasoningMode::None => None,
+        ReasoningMode::Low => Some("low"),
+        ReasoningMode::High | ReasoningMode::Max => Some("high"),
+    }
+}
+
+/// Translate a resolved [`ReasoningMode`] (or, absent one, a thinking budget)
+/// into the reasoning fields this endpoint accepts (#7946).
+///
+/// The four families and why they differ:
+///
+/// * **Kimi / Moonshot** ([`ReasoningEchoPolicy::EmptyString`]) — thinking is
+///   disabled wire-side so multi-turn `tool_calls` work without round-tripping
+///   `reasoning_content`. That is a correctness requirement, not a preference,
+///   so an explicit mode does not override it.
+/// * **OpenRouter** — the nested `reasoning: {"effort": …}` form only.
+///   A body carrying both that and top-level `reasoning_effort` is rejected
+///   with HTTP 400, so this branch never sets the latter.
+/// * **DeepSeek V4** ([`ReasoningEchoPolicy::Echo`]) — `thinking` gates,
+///   `reasoning_effort` grades. With no explicit mode nothing is sent: V4
+///   reasons by default and its docs say `budget_tokens` is ignored, so
+///   deriving an effort from the budget would change the wire shape of every
+///   existing V4 request without changing what the model does.
+/// * **Everything else** ([`ReasoningEchoPolicy::None`]) — top-level
+///   `reasoning_effort`, with the pre-#7946 `budget_tokens` bucket as the
+///   fallback when no mode is set.
+///
+/// DeepSeek R1 ([`ReasoningEchoPolicy::Strip`]) reasons unconditionally and
+/// exposes no wire toggle, so it gets nothing in either dialect — including
+/// when routed through OpenRouter, which is why it short-circuits ahead of the
+/// family branch.
+///
+/// `effort_rejected` is the #7769 negative cache: an endpoint that has already
+/// answered 400 to a reasoning control for this model is not asked again.
+fn reasoning_wire_fields(
+    family: ReasoningWireFamily,
+    echo_policy: librefang_types::model_catalog::ReasoningEchoPolicy,
+    mode: Option<ReasoningMode>,
+    budget_tokens: Option<u32>,
+    effort_rejected: bool,
+) -> ReasoningWireFields {
+    use librefang_types::model_catalog::ReasoningEchoPolicy;
+
+    let mut out = ReasoningWireFields::default();
+
+    if echo_policy == ReasoningEchoPolicy::EmptyString {
+        out.thinking = Some(serde_json::json!({"type": "disabled"}));
+        return out;
+    }
+
+    // DeepSeek R1 reasons unconditionally and exposes no wire toggle, in either
+    // dialect. This returns before the family branch below so an R1 route
+    // through OpenRouter is not handed a budget-derived `reasoning.effort` it
+    // never received before #7946 — the model has nothing to do with it.
+    if echo_policy == ReasoningEchoPolicy::Strip {
+        return out;
+    }
+
+    if effort_rejected {
+        return out;
+    }
+
+    if family == ReasoningWireFamily::OpenRouter {
+        let effort = match mode {
+            Some(m) => Some(openrouter_reasoning_effort(m)),
+            None => budget_tokens.and_then(reasoning_effort_for_budget),
+        };
+        out.reasoning = effort.map(|e| serde_json::json!({"effort": e}));
+        return out;
+    }
+
+    match echo_policy {
+        // No mode → nothing sent, preserving the pre-#7946 V4 wire shape.
+        ReasoningEchoPolicy::Echo => {
+            if let Some(m) = mode {
+                match deepseek_reasoning_effort(m) {
+                    Some(effort) => {
+                        out.thinking = Some(serde_json::json!({"type": "enabled"}));
+                        out.reasoning_effort = Some(effort);
+                    }
+                    None => out.thinking = Some(serde_json::json!({"type": "disabled"})),
+                }
+            }
+        }
+        ReasoningEchoPolicy::None => {
+            out.reasoning_effort = match mode {
+                Some(m) => generic_reasoning_effort(m),
+                None => budget_tokens.and_then(reasoning_effort_for_budget),
+            };
+        }
+        // `Strip` and `EmptyString` both returned above.
+        _ => {}
+    }
+
+    out
 }
 
 /// Convert a [`ResponseFormat`] into the OpenAI `response_format` JSON value.
@@ -988,22 +1297,10 @@ impl OpenAIDriver {
                                     },
                                 });
                             }
-                            ContentBlock::ImageFile { media_type, path } => {
-                                match tokio::task::block_in_place(|| std::fs::read(path)) {
-                                    Ok(bytes) => {
-                                        use base64::Engine;
-                                        let data = base64::engine::general_purpose::STANDARD
-                                            .encode(&bytes);
-                                        parts.push(OaiContentPart::ImageUrl {
-                                            image_url: OaiImageUrl {
-                                                url: format!("data:{media_type};base64,{data}"),
-                                            },
-                                        });
-                                    }
-                                    Err(e) => {
-                                        warn!(path = %path, error = %e, "ImageFile missing, skipping");
-                                    }
-                                }
+                            ContentBlock::ImageFile { path, .. } => {
+                                return Err(LlmError::Http(format!(
+                                    "ImageFile was not asynchronously preprocessed: {path}"
+                                )));
                             }
                             ContentBlock::Thinking { .. } => {}
                             _ => {}
@@ -1164,6 +1461,18 @@ impl OpenAIDriver {
 
         let extra_body = request.extra_body.clone();
 
+        // Per-provider reasoning translation (#7946). The mode reaching here is
+        // already resolved (per-call > per-agent > global > compiled default) —
+        // the kernel folds all three layers into `manifest.thinking` before
+        // building the `CompletionRequest`.
+        let reasoning = reasoning_wire_fields(
+            self.reasoning_wire_family(),
+            echo_policy,
+            request.thinking.as_ref().and_then(|tc| tc.reasoning_mode),
+            request.thinking.as_ref().map(|tc| tc.budget_tokens),
+            self.reasoning_effort_rejected(&request.model),
+        );
+
         Ok(OaiRequest {
             model: request.model.clone(),
             messages: oai_messages,
@@ -1184,23 +1493,12 @@ impl OpenAIDriver {
             tool_choice,
             stream: false,
             stream_options: None,
-            // EmptyString policy disables thinking wire-side so multi-turn
-            // tool_calls don't require carrying back full reasoning_content.
-            thinking: if echo_policy == ReasoningEchoPolicy::EmptyString {
-                Some(serde_json::json!({"type": "disabled"}))
-            } else {
-                None
-            },
-            // Request extended thinking when the caller configured a budget (#6398).
-            // Emitted only under the default `None` echo policy: `EmptyString` (Kimi) disables thinking wire-side above, and `Strip` / `Echo` models (DeepSeek R1 / V4) reason by default without an opt-in — this API family rejects requests with unexpected reasoning fields (see the R1 `reasoning_content` note above), so nothing extra is sent to them.
-            reasoning_effort: if echo_policy == ReasoningEchoPolicy::None {
-                request
-                    .thinking
-                    .as_ref()
-                    .and_then(|tc| reasoning_effort_for_budget(tc.budget_tokens))
-            } else {
-                None
-            },
+            // All three reasoning fields come from one resolver (#7946) so the
+            // OpenRouter mutual-exclusion invariant is enforced in a single
+            // place rather than implied by three independent conditionals.
+            thinking: reasoning.thinking,
+            reasoning_effort: reasoning.reasoning_effort,
+            reasoning: reasoning.reasoning,
             response_format: request
                 .response_format
                 .as_ref()
@@ -1225,6 +1523,7 @@ impl LlmDriver for OpenAIDriver {
         if self.is_moonshot() {
             self.preprocess_moonshot_files(&mut request).await?;
         }
+        self.preprocess_image_files(&mut request).await;
         let mut oai_request = self.build_request(&request)?;
 
         // Cross-process / cross-restart rate-limit guard. A previously
@@ -1364,6 +1663,27 @@ impl LlmDriver for OpenAIDriver {
                     oai_request.temperature = None;
                     // Small backoff before retrying so we don't tight-loop on a
                     // misconfigured request (100 ms × attempt, max ~300 ms).
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * (attempt as u64 + 1),
+                    ))
+                    .await;
+                    continue;
+                }
+
+                // A gateway that will not forward the reasoning control rejects the request before the model sees it (#7769).
+                // Strip the field, remember the model so `build_request` omits it from here on, and retry — the same shape as the `temperature` strip above.
+                // Both spellings are stripped (#7946): OpenRouter-routed bodies carry the nested `reasoning` object instead of top-level `reasoning_effort`, and a gateway in front of OpenRouter can reject that just as readily.
+                if status == 400
+                    && (oai_request.reasoning_effort.is_some() || oai_request.reasoning.is_some())
+                    && crate::llm_driver::llm_errors::is_unsupported_reasoning_effort_error(&body)
+                    && attempt < max_retries
+                {
+                    warn!(model = %oai_request.model, "Gateway rejected reasoning control, retrying without it");
+                    oai_request.reasoning_effort = None;
+                    oai_request.reasoning = None;
+                    self.record_reasoning_effort_rejected(&oai_request.model);
+                    // Same small backoff as the sibling parameter strips, so a
+                    // misconfigured request cannot tight-loop.
                     tokio::time::sleep(std::time::Duration::from_millis(
                         100 * (attempt as u64 + 1),
                     ))
@@ -1657,6 +1977,7 @@ impl LlmDriver for OpenAIDriver {
         if self.is_moonshot() {
             self.preprocess_moonshot_files(&mut request).await?;
         }
+        self.preprocess_image_files(&mut request).await;
         let mut oai_request = self.build_request(&request)?;
         oai_request.stream = true;
         oai_request.stream_options = Some(serde_json::json!({"include_usage": true}));
@@ -1800,6 +2121,27 @@ impl LlmDriver for OpenAIDriver {
                     continue;
                 }
 
+                // A gateway that will not forward the reasoning control rejects the request before the model sees it (#7769).
+                // Strip the field, remember the model so `build_request` omits it from here on, and retry — the same shape as the `temperature` strip above.
+                // Both spellings are stripped (#7946): OpenRouter-routed bodies carry the nested `reasoning` object instead of top-level `reasoning_effort`, and a gateway in front of OpenRouter can reject that just as readily.
+                if status == 400
+                    && (oai_request.reasoning_effort.is_some() || oai_request.reasoning.is_some())
+                    && crate::llm_driver::llm_errors::is_unsupported_reasoning_effort_error(&body)
+                    && attempt < max_retries
+                {
+                    warn!(model = %oai_request.model, "Gateway rejected reasoning control, retrying without it (stream)");
+                    oai_request.reasoning_effort = None;
+                    oai_request.reasoning = None;
+                    self.record_reasoning_effort_rejected(&oai_request.model);
+                    // Same small backoff as the sibling parameter strips, so a
+                    // misconfigured request cannot tight-loop.
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * (attempt as u64 + 1),
+                    ))
+                    .await;
+                    continue;
+                }
+
                 // GPT-5 / o-series: switch from max_tokens to max_completion_tokens.
                 // Add a small backoff to avoid a tight retry loop (#3758).
                 if status == 400
@@ -1913,8 +2255,10 @@ impl LlmDriver for OpenAIDriver {
             // Filter <think>...</think> tags from streaming text deltas so they
             // don't leak through to the client as visible text.
             let mut think_filter = StreamingThinkFilter::new();
-            // Track tool calls: index -> (id, name, arguments)
-            let mut tool_accum: Vec<(String, String, String)> = Vec::new();
+            // Track provider-indexed tool calls. Some compatible providers
+            // deliver function metadata before the call ID, so emission is
+            // deferred until both required fields are available.
+            let mut tool_accum: Vec<StreamedToolCall> = Vec::new();
             let mut finish_reason: Option<String> = None;
             let mut usage = TokenUsage::default();
             let mut cached_prompt_tokens: u64 = 0;
@@ -2131,45 +2475,60 @@ impl LlmDriver for OpenAIDriver {
                                     continue;
                                 }
 
-                                // Ensure tool_accum has enough entries
-                                while tool_accum.len() <= idx {
-                                    tool_accum.push((String::new(), String::new(), String::new()));
-                                }
+                                // Grow to a sparse provider-supplied index in
+                                // one allocation rather than one push per slot.
+                                tool_accum.resize_with(idx + 1, StreamedToolCall::default);
 
                                 // ID (sent in first chunk for this tool)
                                 if let Some(id) = call["id"].as_str() {
-                                    tool_accum[idx].0 = id.to_string();
+                                    tool_accum[idx].id = id.to_string();
                                 }
 
                                 if let Some(func) = call.get("function") {
                                     // Name (sent in first chunk)
                                     if let Some(name) = func["name"].as_str() {
-                                        tool_accum[idx].1 = name.to_string();
-                                        if tx
-                                            .send(StreamEvent::ToolUseStart {
-                                                id: tool_accum[idx].0.clone(),
-                                                name: name.to_string(),
-                                            })
-                                            .await
-                                            .is_err()
-                                        {
-                                            receiver_dropped = true;
-                                        }
+                                        tool_accum[idx].name = name.to_string();
                                     }
 
                                     // Arguments delta
                                     if let Some(args) = func["arguments"].as_str() {
-                                        tool_accum[idx].2.push_str(args);
-                                        if !args.is_empty()
-                                            && tx
-                                                .send(StreamEvent::ToolInputDelta {
-                                                    text: args.to_string(),
-                                                })
-                                                .await
-                                                .is_err()
-                                        {
-                                            receiver_dropped = true;
-                                        }
+                                        tool_accum[idx].arguments.push_str(args);
+                                    }
+                                }
+
+                                let accumulated = &mut tool_accum[idx];
+                                if !accumulated.start_emitted
+                                    && !accumulated.id.is_empty()
+                                    && !accumulated.name.is_empty()
+                                {
+                                    if tx
+                                        .send(StreamEvent::ToolUseStart {
+                                            id: accumulated.id.clone(),
+                                            name: accumulated.name.clone(),
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        receiver_dropped = true;
+                                    } else {
+                                        accumulated.start_emitted = true;
+                                    }
+                                }
+
+                                if accumulated.start_emitted
+                                    && accumulated.arguments_emitted < accumulated.arguments.len()
+                                {
+                                    let arguments = accumulated.arguments
+                                        [accumulated.arguments_emitted..]
+                                        .to_string();
+                                    if tx
+                                        .send(StreamEvent::ToolInputDelta { text: arguments })
+                                        .await
+                                        .is_err()
+                                    {
+                                        receiver_dropped = true;
+                                    } else {
+                                        accumulated.arguments_emitted = accumulated.arguments.len();
                                     }
                                 }
                             }
@@ -2189,36 +2548,38 @@ impl LlmDriver for OpenAIDriver {
             // bytes surface as U+FFFD instead of vanishing (#3448).
             buffer.push_str(&utf8.finish());
 
+            if receiver_dropped {
+                return Err(LlmError::Http("stream receiver dropped".to_string()));
+            }
+
             // Flush any remaining buffered content from the think filter
             // (e.g. partial tag at stream end, or unclosed think block).
-            // The receiver may have already disconnected mid-stream; if so we
-            // skip the flush. We don't update `receiver_dropped` again here
-            // because nothing after this block reads it.
-            if !receiver_dropped {
-                for action in think_filter.flush() {
-                    match action {
-                        FilterAction::EmitText(t) => {
-                            if tx.send(StreamEvent::TextDelta { text: t }).await.is_err() {
-                                break;
-                            }
+            for action in think_filter.flush() {
+                match action {
+                    FilterAction::EmitText(t) => {
+                        if tx.send(StreamEvent::TextDelta { text: t }).await.is_err() {
+                            return Err(LlmError::Http("stream receiver dropped".to_string()));
                         }
-                        FilterAction::EmitThinking(t) => {
-                            if tx
-                                .send(StreamEvent::ThinkingDelta { text: t })
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
+                    }
+                    FilterAction::EmitThinking(t) => {
+                        if tx
+                            .send(StreamEvent::ThinkingDelta { text: t })
+                            .await
+                            .is_err()
+                        {
+                            return Err(LlmError::Http("stream receiver dropped".to_string()));
                         }
                     }
                 }
             }
 
             // Log stream summary for diagnostics
+            let has_complete_tool_call = tool_accum
+                .iter()
+                .any(|call| !call.id.is_empty() && !call.name.is_empty());
             let is_empty_stream = text_content.is_empty()
                 && reasoning_content.is_empty()
-                && tool_accum.is_empty()
+                && !has_complete_tool_call
                 && usage.input_tokens == 0
                 && usage.output_tokens == 0;
             if is_empty_stream {
@@ -2229,6 +2590,21 @@ impl LlmDriver for OpenAIDriver {
                     buffer_remaining = buffer.len(),
                     "SSE stream returned empty: 0 content, 0 tokens — likely a silently failed request"
                 );
+                let error = LlmError::Http(
+                    "OpenAI-compatible SSE stream ended without content, tool calls, or usage"
+                        .to_string(),
+                );
+                if attempt < max_retries {
+                    let delay = standard_retry_delay(attempt + 1, std::time::Duration::ZERO);
+                    warn!(
+                        attempt,
+                        delay_ms = delay.as_millis(),
+                        "Empty SSE stream, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(error);
             } else {
                 debug!(
                     chunks = chunk_count,
@@ -2285,7 +2661,7 @@ impl LlmDriver for OpenAIDriver {
             let has_thinking = content
                 .iter()
                 .any(|b| matches!(b, ContentBlock::Thinking { .. }));
-            if has_thinking && !has_text && tool_accum.is_empty() {
+            if has_thinking && !has_text && !has_complete_tool_call {
                 let thinking_text = content
                     .iter()
                     .find_map(|b| match b {
@@ -2304,41 +2680,41 @@ impl LlmDriver for OpenAIDriver {
                 });
             }
 
-            for (id, name, arguments) in &tool_accum {
+            for call in &tool_accum {
                 // Skip malformed tool calls (empty ID or name can happen if
                 // streaming chunks arrive out of order or are dropped by proxy,
                 // e.g. the GitHub Copilot proxy occasionally drops the function
                 // name chunk). Replaying these to the API yields
                 // "tool call must have a tool call ID and function name" errors.
-                if id.is_empty() || name.is_empty() {
+                if call.id.is_empty() || call.name.is_empty() {
                     warn!(
-                        tool_id = %id,
-                        tool_name = %name,
+                        tool_id = %call.id,
+                        tool_name = %call.name,
                         "Skipping tool call with empty ID or name from streaming response"
                     );
                     continue;
                 }
-                let input: serde_json::Value = match parse_tool_args(arguments) {
+                let input: serde_json::Value = match parse_tool_args(&call.arguments) {
                     Ok(v) => ensure_object(v),
                     Err(e) => {
                         tracing::warn!(
-                            tool = %name,
-                            raw_args_len = arguments.len(),
+                            tool = %call.name,
+                            raw_args_len = call.arguments.len(),
                             error = %e,
                             "Malformed tool call arguments from LLM stream"
                         );
-                        malformed_tool_input(&e, arguments.len())
+                        malformed_tool_input(&e, call.arguments.len())
                     }
                 };
                 content.push(ContentBlock::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
+                    id: call.id.clone(),
+                    name: call.name.clone(),
                     input: input.clone(),
                     provider_metadata: None,
                 });
                 tool_calls.push(ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
+                    id: call.id.clone(),
+                    name: call.name.clone(),
                     input: input.clone(),
                 });
 
@@ -2346,8 +2722,8 @@ impl LlmDriver for OpenAIDriver {
                 // final response below so the caller (if present) gets it.
                 let _ = tx
                     .send(StreamEvent::ToolUseEnd {
-                        id: id.clone(),
-                        name: name.clone(),
+                        id: call.id.clone(),
+                        name: call.name.clone(),
                         input,
                     })
                     .await;
@@ -2489,7 +2865,6 @@ fn extract_thinking_summary(thinking: &str) -> String {
     }
 }
 
-/// Parse Groq's `tool_use_failed` error and extract the tool call from `failed_generation`.
 /// Extract the max_tokens limit from an API error message.
 /// Looks for patterns like: `must be less than or equal to \`8192\``
 fn extract_max_tokens_limit(body: &str) -> Option<u32> {
@@ -2514,6 +2889,8 @@ fn extract_max_tokens_limit(body: &str) -> Option<u32> {
     None
 }
 
+/// Parse Groq's `tool_use_failed` error and extract tool calls from
+/// `failed_generation`.
 ///
 /// Some models (e.g. Llama 3.3) generate tool calls as XML: `<function=NAME ARGS></function>`
 /// instead of the proper JSON format. Groq rejects these with `tool_use_failed` but includes
@@ -2528,11 +2905,15 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
     // Format: <function=tool_name{"arg":"val"}></function> or <function=tool_name {"arg":"val"}></function>
     let mut tool_calls = Vec::new();
     let mut remaining = failed;
+    let mut truncated_function = false;
 
     while let Some(start) = remaining.find("<function=") {
         remaining = &remaining[start + 10..]; // skip "<function="
                                               // Find the end tag
-        let end = remaining.find("</function>")?;
+        let Some(end) = remaining.find("</function>") else {
+            truncated_function = true;
+            break;
+        };
         let mut call_content = &remaining[..end];
         remaining = &remaining[end + 11..]; // skip "</function>"
 
@@ -2571,6 +2952,9 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
     }
 
     if tool_calls.is_empty() {
+        if truncated_function {
+            return None;
+        }
         // No tool calls found — the model generated plain text but Groq rejected it.
         // Return it as a normal text response instead of failing.
         if !failed.trim().is_empty() {
@@ -2696,10 +3080,8 @@ pub const TRUNCATED_ARGS_KEY: &str = "__args_truncated";
 
 /// Build a tool input object for truncated/malformed JSON from the LLM.
 ///
-/// Tries to repair the truncated JSON by closing unclosed strings and braces.
-/// If repair succeeds, returns the partially-parsed object with a truncation
-/// marker so the tool can still execute (partial content is better than nothing).
-/// If repair fails, returns an object with just the marker and error message.
+/// Returns an object containing a truncation marker and the original parse
+/// error so the tool can reject or handle incomplete arguments explicitly.
 pub(crate) fn malformed_tool_input(
     error: &serde_json::Error,
     args_len: usize,
@@ -2798,6 +3180,15 @@ mod tests {
         assert!(result.is_some());
         let resp = result.unwrap();
         assert_eq!(resp.tool_calls[0].name, "shell_exec");
+    }
+
+    #[test]
+    fn groq_recovery_keeps_complete_calls_before_a_truncated_call() {
+        let body = r#"{"error":{"code":"tool_use_failed","failed_generation":"<function=web_fetch{\"url\":\"https://example.com\"}></function><function=shell_exec{\"command\":\"ls\"}"}}"#;
+        let response = parse_groq_failed_tool_call(body).expect("first complete call must survive");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "web_fetch");
     }
 
     #[test]
@@ -3410,7 +3801,8 @@ mod tests {
         assert_eq!(reasoning_effort_for_budget(u32::MAX), Some("high"));
     }
 
-    /// Strip / Echo models (DeepSeek R1 / V4 families) reason by default and reject requests carrying unexpected reasoning fields — a configured budget must not emit `reasoning_effort` to them.
+    /// Strip / Echo models (DeepSeek R1 / V4 families) reason by default, so a configured budget alone must not emit `reasoning_effort` to them — DeepSeek ignores `budget_tokens`, and the derived bucket would change the wire shape without changing the behaviour.
+    /// An *explicit* `reasoning_mode` does reach V4 (#7946); see `deepseek_v4_direct_graded_modes_enable_thinking_with_effort`.
     #[test]
     fn strip_and_echo_policies_do_not_emit_reasoning_effort() {
         use librefang_types::config::ThinkingConfig;
@@ -3458,6 +3850,394 @@ mod tests {
         let mut wire = serde_json::to_value(&oai).expect("serialize");
         merge_extra_body(&oai.extra_body, &mut wire);
         assert_eq!(wire["reasoning_effort"], "high");
+    }
+
+    /// An `extra_body.reasoning_effort` override on an OpenRouter-routed
+    /// request must clear the nested `reasoning` object `reasoning_wire_fields`
+    /// already resolved, or the merged body carries both spellings —
+    /// exactly the combination OpenRouter answers HTTP 400 to.
+    #[test]
+    fn extra_body_reasoning_effort_override_clears_the_nested_openrouter_spelling() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        let driver = OpenAIDriver::new(String::new(), "https://openrouter.ai/api/v1".to_string());
+        let mut req =
+            build_catalog_policy_test_request("some-thinking-model", ReasoningEchoPolicy::None);
+        req.thinking = Some(ThinkingConfig {
+            reasoning_mode: Some(ReasoningMode::High),
+            ..Default::default()
+        });
+        req.extra_body = Some(std::collections::BTreeMap::from([(
+            "reasoning_effort".to_string(),
+            serde_json::json!("low"),
+        )]));
+        let oai = driver.build_request(&req).expect("build_request");
+        assert_eq!(oai.reasoning, Some(serde_json::json!({"effort": "high"})));
+        let mut wire = serde_json::to_value(&oai).expect("serialize");
+        merge_extra_body(&oai.extra_body, &mut wire);
+        assert_eq!(wire["reasoning_effort"], "low");
+        assert!(
+            wire.as_object().unwrap().get("reasoning").is_none(),
+            "wire must not carry both reasoning controls: {wire:?}"
+        );
+    }
+
+    /// An `extra_body` that supplies BOTH spellings has overridden both, so the
+    /// merge must honour them rather than cancel them out.
+    ///
+    /// Removing each spelling because the other is present left the body with
+    /// neither: the operator's explicit reasoning control vanished and the model
+    /// silently ran at its provider default with nothing in the payload to
+    /// explain why.
+    #[test]
+    fn extra_body_supplying_both_reasoning_spellings_keeps_both() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        let driver = OpenAIDriver::new(String::new(), "https://openrouter.ai/api/v1".to_string());
+        let mut req =
+            build_catalog_policy_test_request("some-thinking-model", ReasoningEchoPolicy::None);
+        req.thinking = Some(ThinkingConfig {
+            reasoning_mode: Some(ReasoningMode::High),
+            ..Default::default()
+        });
+        req.extra_body = Some(std::collections::BTreeMap::from([
+            ("reasoning_effort".to_string(), serde_json::json!("low")),
+            (
+                "reasoning".to_string(),
+                serde_json::json!({"effort": "xhigh"}),
+            ),
+        ]));
+        let oai = driver.build_request(&req).expect("build_request");
+        let mut wire = serde_json::to_value(&oai).expect("serialize");
+        merge_extra_body(&oai.extra_body, &mut wire);
+        assert_eq!(wire["reasoning_effort"], "low");
+        assert_eq!(wire["reasoning"], serde_json::json!({"effort": "xhigh"}));
+    }
+
+    // ── Per-agent / per-task reasoning mode → wire shape (#7946) ───────────
+    //
+    // These assert the serialized body, not just the struct, and every one of
+    // them asserts what is ABSENT as well as what is present. The absences are
+    // the load-bearing half: OpenRouter answers HTTP 400 to a payload carrying
+    // both `reasoning_effort` and `reasoning.effort`, and OpenAI answers 400 to
+    // `reasoning_effort: "none"`.
+
+    /// A DeepSeek V4 request with `reasoning_mode = "none"` must carry the
+    /// provider's explicit non-think toggle. Omitting the opt-in is not
+    /// equivalent: V4 reasons by default, so "we did not ask" reads as "yes".
+    #[test]
+    fn deepseek_v4_direct_none_mode_disables_thinking_on_the_wire() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        let driver = OpenAIDriver::new(String::new(), "https://api.deepseek.com/v1".to_string());
+        let mut req =
+            build_catalog_policy_test_request("deepseek-v4-pro", ReasoningEchoPolicy::Echo);
+        req.thinking = Some(ThinkingConfig {
+            reasoning_mode: Some(ReasoningMode::None),
+            ..Default::default()
+        });
+        let oai = driver.build_request(&req).expect("build_request");
+        let wire = serde_json::to_value(&oai).expect("serialize");
+        assert_eq!(wire["thinking"], serde_json::json!({"type": "disabled"}));
+        assert!(
+            wire.get("reasoning_effort").is_none(),
+            "a disabled request must not also grade the effort: {wire}"
+        );
+        assert!(wire.get("reasoning").is_none(), "{wire}");
+    }
+
+    /// The three graded modes send `thinking: enabled` plus DeepSeek's own
+    /// effort vocabulary — including `max`, which the pre-#7946 budget bucket
+    /// could never reach.
+    #[test]
+    fn deepseek_v4_direct_graded_modes_enable_thinking_with_effort() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        let driver = OpenAIDriver::new(String::new(), "https://api.deepseek.com/v1".to_string());
+        for (mode, expected) in [
+            (ReasoningMode::Low, "low"),
+            (ReasoningMode::High, "high"),
+            (ReasoningMode::Max, "max"),
+        ] {
+            let mut req =
+                build_catalog_policy_test_request("deepseek-v4-flash", ReasoningEchoPolicy::Echo);
+            req.thinking = Some(ThinkingConfig {
+                reasoning_mode: Some(mode),
+                ..Default::default()
+            });
+            let oai = driver.build_request(&req).expect("build_request");
+            let wire = serde_json::to_value(&oai).expect("serialize");
+            assert_eq!(
+                wire["thinking"],
+                serde_json::json!({"type": "enabled"}),
+                "mode {mode}"
+            );
+            assert_eq!(wire["reasoning_effort"], expected, "mode {mode}");
+            assert!(
+                wire.get("reasoning").is_none(),
+                "direct DeepSeek must not use OpenRouter's nested form: {wire}"
+            );
+        }
+    }
+
+    /// Without an explicit mode a DeepSeek V4 body is byte-for-byte what it was
+    /// before #7946 — no `thinking`, no `reasoning_effort` — even though a
+    /// default `budget_tokens` is present. DeepSeek ignores `budget_tokens`, so
+    /// deriving an effort from it would change the wire shape of every existing
+    /// V4 request without changing what the model does.
+    #[test]
+    fn deepseek_v4_without_a_mode_keeps_the_pre_7946_wire_shape() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        let driver = OpenAIDriver::new(String::new(), "https://api.deepseek.com/v1".to_string());
+        let mut req =
+            build_catalog_policy_test_request("deepseek-v4-pro", ReasoningEchoPolicy::Echo);
+        req.thinking = Some(ThinkingConfig::default()); // budget 10_000, no mode
+        let oai = driver.build_request(&req).expect("build_request");
+        let wire = serde_json::to_value(&oai).expect("serialize");
+        assert!(wire.get("thinking").is_none(), "{wire}");
+        assert!(wire.get("reasoning_effort").is_none(), "{wire}");
+        assert!(wire.get("reasoning").is_none(), "{wire}");
+    }
+
+    /// The same DeepSeek model behind OpenRouter takes the nested form, and
+    /// `max` becomes OpenRouter's name for that rung, `xhigh`.
+    #[test]
+    fn openrouter_routed_deepseek_uses_the_nested_reasoning_object() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        let driver = OpenAIDriver::new(String::new(), "https://openrouter.ai/api/v1".to_string());
+        for (mode, expected) in [
+            (ReasoningMode::None, "none"),
+            (ReasoningMode::Low, "low"),
+            (ReasoningMode::High, "high"),
+            (ReasoningMode::Max, "xhigh"),
+        ] {
+            let mut req = build_catalog_policy_test_request(
+                "openrouter/deepseek/deepseek-v4-pro",
+                ReasoningEchoPolicy::Echo,
+            );
+            req.thinking = Some(ThinkingConfig {
+                reasoning_mode: Some(mode),
+                ..Default::default()
+            });
+            let oai = driver.build_request(&req).expect("build_request");
+            let wire = serde_json::to_value(&oai).expect("serialize");
+            assert_eq!(
+                wire["reasoning"],
+                serde_json::json!({"effort": expected}),
+                "mode {mode}"
+            );
+            assert!(
+                wire.get("reasoning_effort").is_none(),
+                "OpenRouter 400s on a body carrying both spellings: {wire}"
+            );
+            assert!(
+                wire.get("thinking").is_none(),
+                "OpenRouter carries the gate inside `reasoning`, not a sibling `thinking`: {wire}"
+            );
+        }
+    }
+
+    /// With no explicit mode an OpenRouter body still gets the pre-#7946
+    /// `budget_tokens` bucket — translated into the nested form, because that is
+    /// the shape this endpoint accepts.
+    #[test]
+    fn openrouter_falls_back_to_the_budget_bucket_without_a_mode() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        let driver = OpenAIDriver::new(String::new(), "https://openrouter.ai/api/v1".to_string());
+        let mut req =
+            build_catalog_policy_test_request("openrouter/qwen/qwen3", ReasoningEchoPolicy::None);
+        req.thinking = Some(ThinkingConfig::default()); // budget 10_000 → "medium"
+        let oai = driver.build_request(&req).expect("build_request");
+        let wire = serde_json::to_value(&oai).expect("serialize");
+        assert_eq!(wire["reasoning"], serde_json::json!({"effort": "medium"}));
+        assert!(wire.get("reasoning_effort").is_none(), "{wire}");
+    }
+
+    /// A plain OpenAI-compatible endpoint gets the top-level field. `max` is
+    /// clamped to `high` because the OpenAI schema has no rung above it, and
+    /// `none` is expressed by omission because OpenAI 400s on the literal.
+    #[test]
+    fn generic_openai_compatible_model_maps_modes_to_top_level_effort() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        let driver = OpenAIDriver::new(String::new(), "https://api.openai.com/v1".to_string());
+        for (mode, expected) in [
+            (ReasoningMode::None, None),
+            (ReasoningMode::Low, Some("low")),
+            (ReasoningMode::High, Some("high")),
+            (ReasoningMode::Max, Some("high")),
+        ] {
+            let mut req =
+                build_catalog_policy_test_request("gpt-mystery", ReasoningEchoPolicy::None);
+            req.thinking = Some(ThinkingConfig {
+                reasoning_mode: Some(mode),
+                ..Default::default()
+            });
+            let oai = driver.build_request(&req).expect("build_request");
+            let wire = serde_json::to_value(&oai).expect("serialize");
+            match expected {
+                Some(e) => assert_eq!(wire["reasoning_effort"], e, "mode {mode}"),
+                None => assert!(
+                    wire.get("reasoning_effort").is_none(),
+                    "mode {mode} must omit the field rather than send a literal \"none\": {wire}"
+                ),
+            }
+            assert!(
+                wire.get("reasoning").is_none(),
+                "the nested form is OpenRouter-only: {wire}"
+            );
+        }
+    }
+
+    /// An explicit mode wins over the `budget_tokens` bucket. `budget_tokens:
+    /// 10_000` alone derives `medium`; asking for `low` must send `low`.
+    #[test]
+    fn explicit_mode_wins_over_the_budget_bucket() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        let driver = OpenAIDriver::new(String::new(), "https://example.com/v1".to_string());
+        let mut req = build_catalog_policy_test_request("mystery", ReasoningEchoPolicy::None);
+        req.thinking = Some(ThinkingConfig {
+            budget_tokens: 10_000,
+            stream_thinking: false,
+            reasoning_mode: Some(ReasoningMode::Low),
+        });
+        let oai = driver.build_request(&req).expect("build_request");
+        assert_eq!(oai.reasoning_effort, Some("low"));
+    }
+
+    /// Kimi disables thinking wire-side so multi-turn `tool_calls` work without
+    /// round-tripping `reasoning_content`. That is a correctness requirement,
+    /// not a preference, so an explicit mode must not re-enable it.
+    #[test]
+    fn kimi_disable_wins_over_an_explicit_reasoning_mode() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        let driver = OpenAIDriver::new(String::new(), "https://example.com/v1".to_string());
+        let mut req =
+            build_catalog_policy_test_request("kimi-k2.5", ReasoningEchoPolicy::EmptyString);
+        req.thinking = Some(ThinkingConfig {
+            reasoning_mode: Some(ReasoningMode::Max),
+            ..Default::default()
+        });
+        let oai = driver.build_request(&req).expect("build_request");
+        assert_eq!(oai.thinking, Some(serde_json::json!({"type": "disabled"})));
+        assert_eq!(oai.reasoning_effort, None);
+        assert_eq!(oai.reasoning, None);
+    }
+
+    /// The #7769 negative cache suppresses BOTH spellings. An endpoint that has
+    /// already answered 400 to a reasoning control for this model is not asked
+    /// again in either dialect.
+    #[test]
+    fn a_rejected_reasoning_control_suppresses_both_spellings() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        for base_url in ["https://openrouter.ai/api/v1", "https://api.openai.com/v1"] {
+            let driver = OpenAIDriver::new(String::new(), base_url.to_string());
+            driver.record_reasoning_effort_rejected("picky-model");
+            let mut req =
+                build_catalog_policy_test_request("picky-model", ReasoningEchoPolicy::None);
+            req.thinking = Some(ThinkingConfig {
+                reasoning_mode: Some(ReasoningMode::High),
+                ..Default::default()
+            });
+            let oai = driver.build_request(&req).expect("build_request");
+            assert_eq!(oai.reasoning_effort, None, "{base_url}");
+            assert_eq!(oai.reasoning, None, "{base_url}");
+        }
+    }
+
+    /// DeepSeek R1 has no wire toggle, so it must receive nothing in either
+    /// dialect — including through OpenRouter, where the budget bucket would
+    /// otherwise have started emitting a `reasoning.effort` it never got before
+    /// #7946. R1 always reasons; the field would change the payload without
+    /// changing the model.
+    #[test]
+    fn deepseek_r1_gets_no_reasoning_control_in_either_dialect() {
+        use librefang_types::config::ThinkingConfig;
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        for base_url in [
+            "https://openrouter.ai/api/v1",
+            "https://api.deepseek.com/v1",
+        ] {
+            let driver = OpenAIDriver::new(String::new(), base_url.to_string());
+            for mode in [None, Some(ReasoningMode::None), Some(ReasoningMode::Max)] {
+                let mut req =
+                    build_catalog_policy_test_request("deepseek-r1", ReasoningEchoPolicy::Strip);
+                req.thinking = Some(ThinkingConfig {
+                    reasoning_mode: mode,
+                    ..Default::default()
+                });
+                let oai = driver.build_request(&req).expect("build_request");
+                let wire = serde_json::to_value(&oai).expect("serialize");
+                assert!(
+                    wire.get("thinking").is_none(),
+                    "{base_url} {mode:?}: {wire}"
+                );
+                assert!(
+                    wire.get("reasoning_effort").is_none(),
+                    "{base_url} {mode:?}: {wire}"
+                );
+                assert!(
+                    wire.get("reasoning").is_none(),
+                    "{base_url} {mode:?}: {wire}"
+                );
+            }
+        }
+    }
+
+    /// The invariant, checked exhaustively rather than per-case: no payload the
+    /// resolver can produce carries both `reasoning_effort` and
+    /// `reasoning.effort`. OpenRouter answers HTTP 400 to one that does, and a
+    /// future branch that sets the wrong pair would otherwise only surface as a
+    /// production 400 on one provider.
+    #[test]
+    fn no_payload_ever_carries_both_reasoning_controls() {
+        use librefang_types::model_catalog::ReasoningEchoPolicy;
+        let modes = [
+            None,
+            Some(ReasoningMode::None),
+            Some(ReasoningMode::Low),
+            Some(ReasoningMode::High),
+            Some(ReasoningMode::Max),
+        ];
+        let policies = [
+            ReasoningEchoPolicy::None,
+            ReasoningEchoPolicy::Strip,
+            ReasoningEchoPolicy::Echo,
+            ReasoningEchoPolicy::EmptyString,
+        ];
+        let families = [ReasoningWireFamily::Direct, ReasoningWireFamily::OpenRouter];
+        for family in families {
+            for policy in policies {
+                for mode in modes {
+                    for budget in [None, Some(0), Some(2_000), Some(10_000), Some(100_000)] {
+                        for rejected in [false, true] {
+                            let f = reasoning_wire_fields(family, policy, mode, budget, rejected);
+                            assert!(
+                                !(f.reasoning_effort.is_some() && f.reasoning.is_some()),
+                                "both reasoning controls set for {family:?}/{policy:?}/{mode:?}/{budget:?}/rejected={rejected}: {f:?}"
+                            );
+                            if family == ReasoningWireFamily::OpenRouter {
+                                assert!(
+                                    f.reasoning_effort.is_none(),
+                                    "OpenRouter must never use the top-level spelling: {f:?}"
+                                );
+                            } else {
+                                assert!(
+                                    f.reasoning.is_none(),
+                                    "only OpenRouter uses the nested spelling: {f:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Catalog `Echo` policy on a model the substring fallback would NOT
@@ -3855,6 +4635,7 @@ mod tests {
             stream_options: None,
             thinking: None,
             reasoning_effort: None,
+            reasoning: None,
             response_format: None,
             extra_body: Some(extra),
         };
@@ -3907,6 +4688,7 @@ mod tests {
                 stream_options: None,
                 thinking: None,
                 reasoning_effort: None,
+                reasoning: None,
                 response_format: None,
                 extra_body: Some(extra),
             };
@@ -3960,6 +4742,7 @@ mod tests {
             stream_options: None,
             thinking: None,
             reasoning_effort: None,
+            reasoning: None,
             response_format: None,
             extra_body: None,
         };
@@ -4227,16 +5010,11 @@ mod tests {
         );
     }
 
-    /// Regression: `ContentBlock::ImageFile` paths must be read via
-    /// `tokio::task::block_in_place` so a multi-MB image read does not
-    /// stall the tokio worker pool. The base64-encoded bytes embedded
-    /// in the resulting `OaiContentPart::ImageUrl` data URL must match
-    /// the bytes on disk.
-    ///
-    /// Wrap with `flavor = "multi_thread"` so `block_in_place` does not
-    /// panic on a single-threaded runtime.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn build_request_imagefile_reads_bytes_without_blocking_worker() {
+    /// Local images are read asynchronously before request construction.
+    /// Running this on a current-thread runtime guards against reintroducing
+    /// `block_in_place`, which panics on that runtime flavor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn imagefile_preprocessing_works_on_current_thread_runtime() {
         use base64::Engine;
         use librefang_types::message::Message;
         use std::io::Write;
@@ -4249,7 +5027,7 @@ mod tests {
             .expect("write png");
 
         let driver = OpenAIDriver::new("k".to_string(), "https://api.openai.com/v1".to_string());
-        let request = CompletionRequest {
+        let mut request = CompletionRequest {
             model: "gpt-4o-mini".to_string(),
             messages: std::sync::Arc::new(vec![Message {
                 role: Role::User,
@@ -4278,6 +5056,7 @@ mod tests {
 
             ..Default::default()
         };
+        driver.preprocess_image_files(&mut request).await;
         let wire = driver.build_request(&request).expect("build");
         let user = wire
             .messages
@@ -4475,6 +5254,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn concurrent_moonshot_uploads_are_single_flight_per_content_hash() {
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/files"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "file-shared"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let driver = OpenAIDriver::new("test-key".to_string(), server.uri());
+        let bytes = b"same moonshot document";
+        let hash: [u8; 32] = Sha256::digest(bytes).into();
+        let (first, second) = tokio::join!(
+            driver.upload_file_to_moonshot_cached(hash, bytes, "document.txt", "text/plain"),
+            driver.upload_file_to_moonshot_cached(hash, bytes, "document.txt", "text/plain")
+        );
+
+        assert_eq!(first.unwrap(), "file-shared");
+        assert_eq!(second.unwrap(), "file-shared");
+        server.verify().await;
+    }
+
     // ── #10: transport-error retry behaviour ────────────────────────────
 
     /// Spawn a fake HTTP server that drops (resets) its first `drop_first`
@@ -4553,6 +5361,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_sse_stream_is_an_error_instead_of_a_blank_success() {
+        let base = spawn_sse_server("data: [DONE]\n".to_string()).await;
+        let driver = OpenAIDriver::new("test-key".to_string(), base).with_max_retries(0);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        let error = driver
+            .stream(transport_retry_request(), tx)
+            .await
+            .expect_err("empty provider stream must fail");
+
+        assert!(
+            matches!(error, LlmError::Http(ref message) if message.contains("ended without content")),
+            "unexpected empty-stream error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_sse_stream_retries_before_returning_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _backoff = crate::backoff::enable_test_zero_backoff();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw("data: [DONE]\n", "text/event-stream"),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\
+                 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\
+                 data: [DONE]\n",
+                "text/event-stream",
+            ))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let driver = OpenAIDriver::new("test-key".to_string(), server.uri()).with_max_retries(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let response = driver
+            .stream(transport_retry_request(), tx)
+            .await
+            .expect("second stream should recover");
+
+        assert_eq!(response.text(), "recovered");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn streamed_tool_call_with_out_of_range_index_is_dropped() {
         let bad_index = MAX_STREAMED_TOOL_CALLS; // first out-of-range value
         let sse_body = format!(
@@ -4590,6 +5454,55 @@ mod tests {
             "out-of-range tool index must not appear in the response"
         );
         assert_eq!(resp.text(), "ok");
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_call_waits_for_late_id_before_emitting_events() {
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"shell_exec\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}]}}]}\n\
+             data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_late\"}]}}]}\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\
+             data: [DONE]\n"
+            .to_string();
+        let base = spawn_sse_server(sse_body).await;
+        let driver = OpenAIDriver::new("test-key".to_string(), base);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let response = driver
+            .stream(transport_retry_request(), tx)
+            .await
+            .expect("late tool ID should still produce a valid call");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_late");
+        assert_eq!(response.tool_calls[0].name, "shell_exec");
+        assert_eq!(response.tool_calls[0].input["command"], "pwd");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::ToolUseStart { id, name })
+                if id == "call_late" && name == "shell_exec"
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(StreamEvent::ToolInputDelta { text })
+                if text == "{\"command\":\"pwd\"}"
+        ));
+        assert!(matches!(
+            events.get(2),
+            Some(StreamEvent::ToolUseEnd { id, name, .. })
+                if id == "call_late" && name == "shell_exec"
+        ));
+        assert!(matches!(
+            events.get(3),
+            Some(StreamEvent::ContentComplete {
+                stop_reason: StopReason::ToolUse,
+                ..
+            })
+        ));
     }
 
     /// Regression: an OpenAI-compatible provider (OpenRouter / Groq) can send a terminal error as an SSE `data:` frame over an already-HTTP-200 body instead of a non-2xx status.

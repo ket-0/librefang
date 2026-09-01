@@ -15,21 +15,31 @@ Behaviour parity with the Rust adapter:
   read JSON envelopes (``hello`` / ``events_api`` / ``interactive`` /
   ``disconnect``). Each ``events_api`` / ``interactive`` envelope
   must be ACK'd by echoing back ``{"envelope_id": "..."}``.
-* **Event handling**: only ``message`` and ``app_mention`` types
-  produce ``message`` events. Subtype filter: bare messages pass,
-  ``message_changed`` extracts ``event.message`` (edit), every other
-  subtype is dropped (joins, leaves, file_share, etc.). Self-skip on
-  ``bot_id`` present OR ``user == bot_user_id``.
+* **Event handling**: only ``message`` and ``app_mention`` types produce ``message`` events.
+  Subtype filter: bare messages pass, ``message_changed`` extracts ``event.message`` (edit), ``file_share`` passes as an ordinary message carrying ``files`` (#7087), every other subtype is dropped (joins, leaves, topic changes, etc.).
+  Self-skip on ``bot_id`` present OR ``user == bot_user_id``.
+* **Inbound attachments** (#7087): a message's ``files`` array becomes an ``Image`` / ``Video`` / ``Audio`` / ``File`` content variant carrying ``url_private_download``, and the adapter declares ``header_rules`` so the daemon fetches that URL with the bot token — Slack's private file URLs 302 to a login page without it.
+  The URL is forwarded rather than the bytes because the daemon's media pipeline is what produces a vision image block, an audio transcription or a saved document path; inbound ``FileData`` is rendered as a text placeholder and its payload discarded, so inlining bytes would deliver nothing.
+  One attachment per message (the wire carries one ``ChannelContent``), the attachment outranks the message text including a slash command, and the message text rides along as the caption for every variant that has one.
+  Policy knobs: ``SLACK_FILE_DOWNLOADS``, ``SLACK_FILE_MAX_BYTES``, ``SLACK_FILE_ALLOWED_EXTENSIONS``, ``SLACK_FILE_DOWNLOAD_CHANNELS`` and ``SLACK_FILE_DOWNLOAD_EXCLUDE_CHANNELS``.
+  Link-unfurl ``attachments[].image_url`` is deliberately **not** followed: it is preview metadata for a URL somebody pasted, not an upload, and fetching it would point the daemon at an arbitrary host.
 * **Allowed channels**: empty list = allow all. When non-empty,
   channel must be in the list; DMs (``channel`` starts with ``D``)
   are exempt (the operator's per-user DM allowlist handles those).
-* **Display name**: Slack user IDs as display name (the Rust adapter
-  surfaces the raw ``Uxxxxxxx`` id, deliberately — DM resolution and
-  the kernel user mapping run on the id, not the human name).
+* **Display name**: the raw ``Uxxxxxxx`` id by default (DM resolution and the kernel user mapping run on the id, not the human name, and the in-process Rust adapter never spent a call to improve on it).
+  Set ``SLACK_RESOLVE_DISPLAY_NAMES=true`` (#7086) to resolve it through ``users.info`` instead, cached per user id for ``SLACK_DISPLAY_NAME_TTL`` seconds so a busy channel costs a handful of calls a day rather than one per message.
+  Requires the ``users:read`` bot scope; without it every lookup fails and the adapter keeps reporting the id.
+  Off by default because turning it on changes what the daemon *stores*, not only what it shows: the roster row the bridge persists for each group sender carries whatever ``user_name`` this adapter reports.
+  Operators who prefer explicit mappings keep using ``[users]``, which stays authoritative.
 * **Slash commands**: ``/cmd args`` → ``Command`` (text otherwise).
 * **Thread context**: ``thread_ts`` is surfaced as ``thread_id`` so
   replies thread under the originating message.
 * **DM vs group**: ``is_group = not channel.startswith('D')``.
+* **Bulk member enumeration** (#7086): with ``SLACK_ENUMERATE_MEMBERS=true`` every inbound group message carries the channel's full ``conversations.members`` list as ``group_members`` metadata, so an agent can answer "who is in this channel?" for people who have never spoken rather than only for those who have.
+  Cached per channel for ``SLACK_MEMBER_LIST_TTL`` seconds and capped at ``SLACK_MEMBER_LIST_MAX`` members; needs ``channels:read`` / ``groups:read``.
+  Names on this path come from the display-name cache only — a sweep never issues ``users.info``, because resolving hundreds of people who have not spoken would spend the whole per-method budget.
+  Off by default, and for a larger reason than the display-name knob: this changes *how many people* the daemon stores, from those who addressed the agent to everyone the workspace lists in the channel.
+  The daemon keeps those rows classified apart from the observational ones, so ``channel_dm`` still refuses anyone who has never addressed the agent — enumeration widens what can be *reported*, never what can be *messaged*.
 * **Block Kit interactive**: ``block_actions`` payloads → first
   action's ``value`` becomes ``ButtonCallback.action``; ``action_id``,
   ``trigger_id``, and the ``block_action`` flag ride in metadata.
@@ -56,6 +66,16 @@ Configure via ``[[sidecar_channels]]``::
     # SLACK_FORCE_FLAT_REPLIES = "false"
     # SLACK_REACTIONS = "true"
     # SLACK_PROGRESS_CARD = "true"
+    # SLACK_FILE_DOWNLOADS = "true"
+    # SLACK_FILE_MAX_BYTES = "10485760"
+    # SLACK_FILE_ALLOWED_EXTENSIONS = "png,jpg,pdf,mp4"
+    # SLACK_FILE_DOWNLOAD_CHANNELS = "C0123"
+    # SLACK_FILE_DOWNLOAD_EXCLUDE_CHANNELS = "C0789"
+    # SLACK_RESOLVE_DISPLAY_NAMES = "false"
+    # SLACK_DISPLAY_NAME_TTL = "21600"
+    # SLACK_ENUMERATE_MEMBERS = "false"
+    # SLACK_MEMBER_LIST_TTL = "3600"
+    # SLACK_MEMBER_LIST_MAX = "500"
     # SLACK_ACCOUNT_ID = "workspace-prod"
 
 Secrets via ``~/.librefang/secrets.env``: ``SLACK_APP_TOKEN`` (the
@@ -77,6 +97,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from librefang.sidecar import Content, Field, Schema, SidecarAdapter, protocol, run_stdio_main
@@ -114,8 +135,48 @@ SEND_TIMEOUT_SECS = 15.0
 HANDSHAKE_TIMEOUT_SECS = 15.0
 MAX_FILE_UPLOAD_BYTES = 10 * 1024 * 1024
 
+# Hosts that serve Slack's own `url_private` / `url_private_download` file URLs.
+# Inbound attachments are pinned to this set (#7087) and it is the exact set declared in `header_rules`, so the bot token is only ever attached to a fetch of a Slack-hosted file.
+#
+# `files.remote.add` lets any workspace member register a "file" whose `url_private` points at a host of their choosing, and a link unfurl can put an arbitrary `image_url` in `attachments`.
+# Both reach this adapter through an authentic Socket Mode envelope, so "the event came from Slack" says nothing about who chose the URL — the host pin is what keeps a member-chosen address from being fetched with the bot's credentials.
+SLACK_FILE_HOSTS = ("files.slack.com", "slack-files.com")
+
+# Slack `file.mode` values whose `url_private` no longer serves bytes.
+SLACK_UNFETCHABLE_FILE_MODES = frozenset({"tombstone", "hidden_by_limit"})
+
+# Default ceiling on an inbound attachment.
+# Same 10 MiB as the outbound upload cap so a round trip (user uploads, agent edits, agent posts back) does not fail one direction with a size the other accepted.
+DEFAULT_INBOUND_FILE_MAX_BYTES = MAX_FILE_UPLOAD_BYTES
+
 INITIAL_BACKOFF_SECS = 1.0
 READ_TICK_SECS = 30.0
+
+# How long a resolved (or definitively absent) display name is trusted (#7086).
+# Six hours: long enough that a busy channel costs a handful of `users.info` calls a day, short enough that somebody who changes their display name is not misnamed for a week.
+DEFAULT_DISPLAY_NAME_TTL_SECS = 6 * 60 * 60
+
+# How long a *transient* lookup failure (429, transport error) suppresses a retry.
+# Deliberately short — a rate limit that has passed should not keep the whole workspace anonymous for hours.
+NEGATIVE_TTL_SECS = 60.0
+
+# Ceiling on the identity cache. A workspace larger than this degrades into extra lookups, never into unbounded memory.
+MAX_CACHED_IDENTITIES = 5_000
+
+# Bulk member enumeration (#7086).
+#
+# How long a channel's member list is trusted. An hour rather than the display-name TTL's six: joins and leaves are the thing this list is *about*, so a stale one is wrong in a way a stale display name is not.
+DEFAULT_MEMBER_LIST_TTL_SECS = 60 * 60
+
+# Members requested per `conversations.members` page. 200 is Slack's comfortable page size; the method is rate-limited per call, not per member, so larger pages mean fewer calls.
+MEMBER_LIST_PAGE_SIZE = 200
+
+# Ceiling on how many members one channel contributes, across all pages.
+# A general channel in a large workspace lists everyone, and every one of them becomes a stored identity row in the daemon's roster — so the default answers "who is in this channel?" for team-sized channels and declines to for company-sized ones, rather than quietly persisting ten thousand people.
+DEFAULT_MEMBER_LIST_MAX = 500
+
+# Ceiling on the number of channels whose member lists are cached at once.
+MAX_CACHED_MEMBER_LISTS = 256
 
 
 def _resolve_public_url(
@@ -386,6 +447,351 @@ def parse_users_info(body: dict) -> tuple[Optional[str], Optional[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Display-name resolution (#7086)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SlackIdentity:
+    """The human-readable half of a Slack user, as ``users.info`` reports it.
+
+    ``display_name`` is what a person recognises; ``username`` is the ``@handle``.
+    Either may be ``None`` — a workspace can leave both blank, and a bot without the ``users:read`` scope gets neither.
+    """
+
+    display_name: Optional[str] = None
+    username: Optional[str] = None
+
+
+def _first_nonempty(*candidates: Any) -> Optional[str]:
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def parse_users_identity(body: dict) -> tuple[Optional[SlackIdentity], Optional[str]]:
+    """Translate a Slack ``users.info`` response into the name a human would recognise.
+
+    Returns ``(identity, error)``.
+    ``identity`` is ``None`` when the response carries no usable name — a deleted or unknown user, or a workspace where every name field is blank.
+    ``error`` carries the platform error string for a failure the caller should treat as transient (rate limits, transport hiccups); a *definitive* "no such user" answer returns ``(None, None)`` so the caller can cache the absence instead of asking again on every message.
+
+    Precedence for ``display_name`` follows what the person chose to be called, then falls back through what the workspace knows: ``profile.display_name`` → ``profile.real_name`` → ``user.real_name`` → ``user.name``.
+    ``profile.display_name`` is empty for a large share of real accounts, which is why the ladder exists at all — resolving to an empty string would be a regression on the raw id it replaces.
+    """
+    if not isinstance(body, dict):
+        return None, "non-object response"
+    if body.get("ok") is not True:
+        err = str(body.get("error") or "unknown error")
+        if err in ("user_not_found", "users_not_found"):
+            return None, None
+        return None, err
+    user = body.get("user")
+    if not isinstance(user, dict):
+        return None, "response has no user object"
+    profile = user.get("profile")
+    if not isinstance(profile, dict):
+        profile = {}
+    display_name = _first_nonempty(
+        profile.get("display_name"),
+        profile.get("real_name"),
+        user.get("real_name"),
+        user.get("name"),
+    )
+    username = _first_nonempty(user.get("name"))
+    if display_name is None and username is None:
+        return None, None
+    return SlackIdentity(display_name=display_name, username=username), None
+
+
+class _IdentityCache:
+    """Bounded, TTL'd ``user_id`` → :class:`SlackIdentity` cache.
+
+    The cache is the whole point of the feature, not an optimisation on top of it: Slack's ``users.info`` sits in a tiered per-method rate limit, and a busy channel produces one message per member per minute, so an uncached per-message lookup would spend the workspace's budget on re-resolving the same handful of people.
+
+    Absences are cached too, and for the same reason: a deleted user, or a bot without the ``users:read`` scope, otherwise costs one doomed request per message forever.
+    A *transient* failure (a 429, a transport error) is cached only for :data:`NEGATIVE_TTL_SECS`, long enough to stop a burst from hammering the API and short enough that a recovered workspace resolves names again within the minute.
+
+    Eviction is oldest-first on insertion order once ``max_entries`` is reached — the same bound-then-evict shape as ``SlackAdapter._pending_reactions``, so a workspace with more members than the cap degrades into extra lookups rather than unbounded memory.
+    """
+
+    def __init__(self, *, ttl_secs: float, max_entries: int) -> None:
+        self.ttl_secs = ttl_secs
+        self.max_entries = max_entries
+        # user_id -> (expires_at, identity_or_None)
+        self._entries: dict[str, tuple[float, Optional[SlackIdentity]]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, user_id: str) -> tuple[bool, Optional[SlackIdentity]]:
+        """``(hit, identity)``. A hit with ``None`` is a cached absence, not a miss."""
+        now = time.monotonic()
+        with self._lock:
+            entry = self._entries.get(user_id)
+            if entry is None:
+                return False, None
+            expires_at, identity = entry
+            if expires_at <= now:
+                del self._entries[user_id]
+                return False, None
+            return True, identity
+
+    def put(
+        self,
+        user_id: str,
+        identity: Optional[SlackIdentity],
+        *,
+        ttl_secs: Optional[float] = None,
+    ) -> None:
+        ttl = self.ttl_secs if ttl_secs is None else ttl_secs
+        with self._lock:
+            # Re-inserting an existing key must not keep its old insertion position, or a hot entry would be evicted ahead of colder ones.
+            self._entries.pop(user_id, None)
+            while len(self._entries) >= self.max_entries:
+                self._entries.pop(next(iter(self._entries)))
+            self._entries[user_id] = (time.monotonic() + ttl, identity)
+
+
+# ---------------------------------------------------------------------------
+# Bulk member enumeration (#7086)
+# ---------------------------------------------------------------------------
+
+
+def parse_conversations_members(
+    body: dict,
+) -> tuple[list[str], Optional[str], Optional[str]]:
+    """Translate one ``conversations.members`` page into ``(user_ids, next_cursor, error)``.
+
+    ``next_cursor`` is ``None`` when the page is the last one — Slack signals that with an empty string, which is easy to mistake for "keep going with an empty cursor" and would loop forever.
+    ``error`` carries the platform error string; the common ones are ``missing_scope`` (no ``channels:read`` / ``groups:read``), ``channel_not_found`` (the bot is not in the channel) and ``ratelimited``.
+    """
+    if not isinstance(body, dict):
+        return [], None, "non-object response"
+    if body.get("ok") is not True:
+        return [], None, str(body.get("error") or "unknown error")
+    raw = body.get("members")
+    members = [m for m in raw if isinstance(m, str) and m] if isinstance(raw, list) else []
+    metadata = body.get("response_metadata")
+    cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
+    if not isinstance(cursor, str) or not cursor.strip():
+        cursor = None
+    return members, cursor, None
+
+
+class _MemberListCache:
+    """Bounded, TTL'd ``channel_id`` → member-id tuple cache.
+
+    Same shape as :class:`_IdentityCache`, and load-bearing for the same reason: ``conversations.members`` is rate-limited per call, and a busy channel produces many messages per minute while its membership changes a few times a week.
+    Without the cache, enumeration would re-walk every page of a 500-person channel on every inbound message.
+
+    An empty tuple is a legitimate cached value (a channel the bot cannot read, or one it is alone in); ``hit`` distinguishes it from a miss, so a failure costs one sweep per TTL rather than one per message.
+    """
+
+    def __init__(self, *, ttl_secs: float, max_entries: int) -> None:
+        self.ttl_secs = ttl_secs
+        self.max_entries = max_entries
+        self._entries: dict[str, tuple[float, tuple[str, ...]]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, channel_id: str) -> tuple[bool, tuple[str, ...]]:
+        now = time.monotonic()
+        with self._lock:
+            entry = self._entries.get(channel_id)
+            if entry is None:
+                return False, ()
+            expires_at, members = entry
+            if expires_at <= now:
+                del self._entries[channel_id]
+                return False, ()
+            return True, members
+
+    def put(
+        self,
+        channel_id: str,
+        members: tuple[str, ...],
+        *,
+        ttl_secs: Optional[float] = None,
+    ) -> None:
+        ttl = self.ttl_secs if ttl_secs is None else ttl_secs
+        with self._lock:
+            self._entries.pop(channel_id, None)
+            while len(self._entries) >= self.max_entries:
+                self._entries.pop(next(iter(self._entries)))
+            self._entries[channel_id] = (time.monotonic() + ttl, members)
+
+
+# ---------------------------------------------------------------------------
+# Inbound attachments (#7087)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SlackFilePolicy:
+    """Resolved policy for inbound attachments.
+
+    ``enabled=False`` — the default when no policy is supplied — reproduces the pre-#7087 behaviour of dropping every file-bearing message, so an operator can turn the feature off without changing anything else.
+
+    ``channels`` is an allow-list (empty = every channel) and ``excluded_channels`` a deny-list applied on top of it, which is the ergonomic shape for the two things operators actually ask for: "only this one channel accepts uploads" and "every channel except this busy one".
+    """
+
+    enabled: bool = False
+    max_bytes: int = DEFAULT_INBOUND_FILE_MAX_BYTES
+    allowed_extensions: frozenset = frozenset()
+    channels: tuple = ()
+    excluded_channels: tuple = ()
+
+    def enabled_for(self, channel: str) -> bool:
+        """Whether attachments in ``channel`` should be forwarded to the agent."""
+        if not self.enabled:
+            return False
+        if channel in self.excluded_channels:
+            return False
+        return not self.channels or channel in self.channels
+
+    def extension_allowed(self, name: Any, filetype: Any) -> bool:
+        """Whether this file's extension passes the allow-list. An empty allow-list accepts everything."""
+        if not self.allowed_extensions:
+            return True
+        return _file_extension(name, filetype) in self.allowed_extensions
+
+
+def _file_extension(name: Any, filetype: Any) -> str:
+    """Lowercased extension for an inbound Slack file object.
+
+    The filename wins because it is what the agent's tools will see; Slack's own ``filetype`` token is the fallback for uploads that arrive without a usable name.
+    Returns ``""`` when neither yields one, which a non-empty allow-list then rejects.
+    """
+    head, dot, tail = _safe_filename(name).rpartition(".")
+    if dot and head and tail:
+        return tail.lower()
+    if isinstance(filetype, str):
+        return filetype.strip().lstrip(".").lower()
+    return ""
+
+
+def _is_slack_file_url(url: Any) -> bool:
+    """Whether ``url`` is an HTTPS URL served by one of Slack's own file hosts.
+
+    Userinfo is refused outright rather than ignored: ``https://files.slack.com@evil.example/x``
+    reads as a Slack URL to a human and resolves to ``evil.example``.
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname
+    except (TypeError, ValueError):
+        return False
+    if parsed.scheme != "https" or not host:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    return host.rstrip(".").lower() in SLACK_FILE_HOSTS
+
+
+def _file_rejection(entry: Any, policy: SlackFilePolicy) -> Optional[str]:
+    """Return why this Slack file object must not be forwarded, or ``None`` when it passes policy."""
+    if not isinstance(entry, dict):
+        return "file entry is not an object"
+    mode = entry.get("mode")
+    if mode in SLACK_UNFETCHABLE_FILE_MODES:
+        # A deleted file, or one Slack has hidden behind a free-plan storage limit, still arrives with a `url_private` that no longer resolves.
+        # Refusing it here keeps a `[File download failed]` line out of the agent's prompt.
+        return f"file mode is {mode}"
+    url = entry.get("url_private_download") or entry.get("url_private")
+    if not isinstance(url, str) or not url:
+        return "file has neither url_private_download nor url_private"
+    if not _is_slack_file_url(url):
+        return "file URL is not served by a Slack file host"
+    if not policy.extension_allowed(
+        entry.get("name") or entry.get("title"), entry.get("filetype"),
+    ):
+        return "file extension is not in the allow-list"
+    size = entry.get("size")
+    if isinstance(size, int) and not isinstance(size, bool) and size > policy.max_bytes:
+        return f"file is {size} bytes, over the {policy.max_bytes} byte cap"
+    return None
+
+
+def _file_content(entry: dict, companion_text: str) -> dict[str, Any]:
+    """Map one policy-approved Slack file object onto a ``ChannelContent`` variant.
+
+    The URL is handed to the daemon rather than the bytes: the daemon's media pipeline is what turns a URL into an image block for vision, a transcription for audio, or a saved path for a document, and it attaches the bot token for exactly the hosts this adapter declared in ``header_rules``.
+    Inlining bytes as ``FileData`` would not reach any of that — the inbound side of the bridge renders ``FileData`` as a text placeholder and discards the payload.
+    """
+    url = entry.get("url_private_download") or entry.get("url_private")
+    filename = _safe_filename(entry.get("name") or entry.get("title"))
+    raw_mime = entry.get("mimetype")
+    mimetype = raw_mime.strip() if isinstance(raw_mime, str) else ""
+    caption = companion_text or None
+    duration_seconds = 0
+    raw_ms = entry.get("duration_ms")
+    if isinstance(raw_ms, int) and not isinstance(raw_ms, bool) and raw_ms > 0:
+        duration_seconds = raw_ms // 1000
+
+    if mimetype.startswith("image/"):
+        return Content.image(url, caption=caption, mime_type=mimetype)
+    if mimetype.startswith("video/"):
+        return Content.video(url, caption=caption,
+                             duration_seconds=duration_seconds,
+                             filename=filename)
+    if mimetype.startswith("audio/"):
+        title = entry.get("title")
+        return Content.audio(url, caption=caption,
+                             duration_seconds=duration_seconds,
+                             title=title if isinstance(title, str) and title else None)
+    if companion_text:
+        # `ChannelContent::File` has no caption field, so the accompanying message text has nowhere to ride.
+        # Same limitation (and the same warning) as the discord sidecar's file attachments.
+        log.warn(
+            "slack file attachment has companion text that cannot be sent as a caption",
+            filename=filename,
+        )
+    return Content.file(url, filename)
+
+
+def parse_slack_files(
+    files: Any,
+    *,
+    channel: str,
+    companion_text: str,
+    policy: Optional[SlackFilePolicy],
+) -> Optional[dict[str, Any]]:
+    """Pick the first policy-approved attachment out of a message's ``files`` array.
+
+    Returns the ``ChannelContent`` for it, or ``None`` when downloads are off for this channel, the array is absent, or nothing in it passes policy.
+
+    One attachment per message, matching the discord sidecar: the wire protocol carries a single ``ChannelContent`` per message, so a multi-file upload has to pick one.
+    Extras are counted in a warning rather than silently dropped.
+    """
+    if policy is None or not policy.enabled_for(channel):
+        return None
+    if not isinstance(files, list) or not files:
+        return None
+
+    chosen: Optional[dict] = None
+    rejected = 0
+    extra = 0
+    for entry in files:
+        reason = _file_rejection(entry, policy)
+        if reason is not None:
+            log.warn("slack inbound attachment rejected",
+                     channel=channel, reason=reason)
+            rejected += 1
+            continue
+        if chosen is None:
+            chosen = entry
+        else:
+            extra += 1
+    if chosen is None:
+        return None
+    if extra:
+        log.warn("slack forwarded only the first eligible attachment",
+                 channel=channel, ignored=extra, rejected=rejected)
+    return _file_content(chosen, companion_text)
+
+
+# ---------------------------------------------------------------------------
 # Inbound event parsing — port of crate::slack::parse_slack_event and
 # parse_slack_block_action. Pure functions so tests can exercise every
 # filter / variant without standing up the Socket Mode WS.
@@ -398,11 +804,14 @@ def parse_slack_event(
     bot_user_id: Optional[str],
     allowed_channels: list[str],
     account_id: Optional[str],
+    file_policy: Optional[SlackFilePolicy] = None,
 ) -> Optional[dict]:
-    """Mirror of the Rust ``parse_slack_event``.
+    """Mirror of the Rust ``parse_slack_event``, extended with inbound attachments.
 
     Returns the ``message`` event dict ready to ``emit``, or ``None``
     when the payload should be skipped.
+
+    ``file_policy`` defaults to ``None``, which drops every attachment and leaves the pre-#7087 text-only behaviour untouched.
     """
     if not isinstance(event, dict):
         return None
@@ -417,11 +826,12 @@ def parse_slack_event(
             return None
         msg_data = inner
         is_edit = True
-    elif subtype is not None:
-        # Other subtypes (joins, leaves, file_share, …) are skipped —
-        # matches the Rust adapter precisely.
+    elif subtype is not None and subtype != "file_share":
+        # Other subtypes (joins, leaves, topic changes, …) are skipped — matches the Rust adapter precisely.
         return None
     else:
+        # `file_share` shares this arm: it is an ordinary message that also carries `files`, and dropping the whole subtype (#7087) discarded the user's upload before any content parsing ran.
+        # The attachment itself is still gated by `file_policy` below.
         msg_data = event
         is_edit = False
 
@@ -448,15 +858,28 @@ def parse_slack_event(
     ):
         return None
 
-    text = msg_data.get("text")
-    if not isinstance(text, str) or not text:
+    raw_text = msg_data.get("text")
+    text = raw_text if isinstance(raw_text, str) else ""
+
+    file_content = parse_slack_files(
+        msg_data.get("files"),
+        channel=channel,
+        companion_text=text,
+        policy=file_policy,
+    )
+    # An upload with no comment is a complete message; a text-only message with no text is not.
+    if file_content is None and not text:
         return None
 
     ts = (msg_data.get("ts") if is_edit else None) or event.get("ts") or "0"
     if not isinstance(ts, str):
         ts = str(ts)
 
-    if text.startswith("/"):
+    if file_content is not None:
+        # The attachment outranks the text, slash commands included: one message carries one `ChannelContent`, and the upload is the part the agent cannot reconstruct from the transcript.
+        # Same precedence as the discord sidecar.
+        content = file_content
+    elif text.startswith("/"):
         head, _, tail = text[1:].partition(" ")
         content = Content.command(head, tail.split() if tail else [])
     else:
@@ -512,10 +935,8 @@ def parse_slack_event(
         # G… for private groups). The kernel uses this as the reply
         # target — matching Rust's `sender.platform_id = channel`.
         user_id=channel,
-        # Display name is the Slack user id verbatim — the Rust
-        # adapter doesn't try to resolve display names (it would
-        # need an extra `users.info` call per message). Operators
-        # who want human-readable names set them in `[users]`.
+        # Placeholder only. This is a pure function with no workspace access, so it stamps the raw Slack user id and `SlackAdapter._apply_identity` overwrites it with a resolved display name when `SLACK_RESOLVE_DISPLAY_NAMES` is on (#7086).
+        # With resolution off — the default — the raw id is what the agent sees, and operators who want names without the `users:read` scope set them in `[users]`.
         user_name=user_id,
         content=content,
         message_id=ts,
@@ -652,8 +1073,7 @@ class SlackAdapter(SidecarAdapter):
             Field("SLACK_ALLOWED_CHANNELS",
                   "Allowed Channel IDs (comma-separated, empty = allow all)",
                   "text",
-                  placeholder="C0123, C0456",
-                  advanced=True),
+                  placeholder="C0123, C0456"),
             Field("SLACK_UNFURL_LINKS",
                   "Expand link previews in sent messages",
                   "bool",
@@ -662,19 +1082,73 @@ class SlackAdapter(SidecarAdapter):
             Field("SLACK_FORCE_FLAT_REPLIES",
                   "Post replies as top-level messages instead of threads",
                   "bool",
-                  placeholder="false",
-                  advanced=True),
+                  placeholder="false"),
             Field("SLACK_REACTIONS",
                   "Add an eyes reaction while a turn runs and flip it to "
                   "a check / cross when it finishes",
                   "bool",
-                  placeholder="true",
-                  advanced=True),
+                  placeholder="true"),
             Field("SLACK_PROGRESS_CARD",
                   "Show the multi-step task-progress card (defaults to "
                   "following SLACK_REACTIONS)",
                   "bool",
                   placeholder="true",
+                  advanced=True),
+            Field("SLACK_FILE_DOWNLOADS",
+                  "Forward user-uploaded files and images to the agent",
+                  "bool",
+                  placeholder="true"),
+            Field("SLACK_FILE_MAX_BYTES",
+                  "Maximum inbound attachment size in bytes",
+                  "number",
+                  placeholder=str(DEFAULT_INBOUND_FILE_MAX_BYTES),
+                  advanced=True),
+            Field("SLACK_FILE_ALLOWED_EXTENSIONS",
+                  "Allowed attachment extensions (comma-separated, empty = "
+                  "allow all)",
+                  "list",
+                  placeholder="png, jpg, pdf, mp4",
+                  advanced=True),
+            Field("SLACK_FILE_DOWNLOAD_CHANNELS",
+                  "Channel IDs that accept attachments (comma-separated, "
+                  "empty = every channel)",
+                  "list",
+                  placeholder="C0123, C0456",
+                  advanced=True),
+            Field("SLACK_FILE_DOWNLOAD_EXCLUDE_CHANNELS",
+                  "Channel IDs that never accept attachments "
+                  "(comma-separated)",
+                  "list",
+                  placeholder="C0789",
+                  advanced=True),
+            Field("SLACK_RESOLVE_DISPLAY_NAMES",
+                  "Resolve sender display names via users.info (needs the "
+                  "users:read scope; off by default)",
+                  "bool",
+                  placeholder="false",
+                  advanced=True),
+            Field("SLACK_DISPLAY_NAME_TTL",
+                  "How long a resolved display name is cached, in seconds",
+                  "number",
+                  placeholder=str(DEFAULT_DISPLAY_NAME_TTL_SECS),
+                  advanced=True),
+            Field("SLACK_ENUMERATE_MEMBERS",
+                  "List every channel member via conversations.members, not "
+                  "only those who have spoken (needs channels:read / "
+                  "groups:read; off by default)",
+                  "bool",
+                  placeholder="false",
+                  advanced=True),
+            Field("SLACK_MEMBER_LIST_TTL",
+                  "How long an enumerated channel member list is cached, in "
+                  "seconds",
+                  "number",
+                  placeholder=str(DEFAULT_MEMBER_LIST_TTL_SECS),
+                  advanced=True),
+            Field("SLACK_MEMBER_LIST_MAX",
+                  "Maximum members enumerated per channel",
+                  "number",
+                  placeholder=str(DEFAULT_MEMBER_LIST_MAX),
                   advanced=True),
             Field("SLACK_ACCOUNT_ID",
                   "Account ID (multi-bot routing)",
@@ -724,6 +1198,117 @@ class SlackAdapter(SidecarAdapter):
         )
         acct = os.environ.get("SLACK_ACCOUNT_ID", "").strip()
         self.account_id = acct or None
+
+        # Display-name resolution (#7086).
+        #
+        # Default OFF, and deliberately so on two counts.
+        # It needs the `users:read` scope, which a bot installed before this existed does not have — enabling it by default would turn every inbound message into a logged `missing_scope` failure on upgrade.
+        # And it is the point at which the daemon starts learning and persisting real people's names: the roster row the bridge writes carries whatever `user_name` this adapter reports, so turning this on changes what is stored, not just what is displayed.
+        # An operator opts in; nobody has personal data resolved on their behalf by an upgrade.
+        self.resolve_display_names = _bool_env(
+            os.environ.get("SLACK_RESOLVE_DISPLAY_NAMES", ""), default=False,
+        )
+        ttl_raw = os.environ.get("SLACK_DISPLAY_NAME_TTL", "").strip()
+        try:
+            display_name_ttl = float(ttl_raw or DEFAULT_DISPLAY_NAME_TTL_SECS)
+        except (TypeError, ValueError):
+            log.error("SLACK_DISPLAY_NAME_TTL invalid (must be a number of seconds)",
+                      value=ttl_raw)
+            raise SystemExit(2) from None
+        if display_name_ttl <= 0:
+            log.warn("SLACK_DISPLAY_NAME_TTL <= 0; using the default instead",
+                     requested=display_name_ttl,
+                     default=DEFAULT_DISPLAY_NAME_TTL_SECS)
+            display_name_ttl = float(DEFAULT_DISPLAY_NAME_TTL_SECS)
+        self.display_name_ttl = display_name_ttl
+        self._identity_cache = _IdentityCache(
+            ttl_secs=display_name_ttl,
+            max_entries=MAX_CACHED_IDENTITIES,
+        )
+
+        # Bulk member enumeration (#7086).
+        #
+        # Default OFF, and for a strictly larger version of the reason `SLACK_RESOLVE_DISPLAY_NAMES` is.
+        # That knob changes the *quality* of what is stored about the handful of people who have spoken to the agent; this one changes *how many people* are stored at all, from "those who addressed the bot" to "everyone the workspace lists in this channel", most of whom have never interacted with it and did not choose to.
+        # It also needs `channels:read` / `groups:read`, which a bot installed before this existed does not have, so enabling it by default would turn every group message into a logged `missing_scope`.
+        #
+        # The two knobs are independent: enumeration on with resolution off records opaque ids, which is the least-data configuration that still answers "who is in this channel?".
+        self.enumerate_members = _bool_env(
+            os.environ.get("SLACK_ENUMERATE_MEMBERS", ""), default=False,
+        )
+        member_ttl_raw = os.environ.get("SLACK_MEMBER_LIST_TTL", "").strip()
+        try:
+            member_list_ttl = float(member_ttl_raw or DEFAULT_MEMBER_LIST_TTL_SECS)
+        except (TypeError, ValueError):
+            log.error("SLACK_MEMBER_LIST_TTL invalid (must be a number of seconds)",
+                      value=member_ttl_raw)
+            raise SystemExit(2) from None
+        if member_list_ttl <= 0:
+            log.warn("SLACK_MEMBER_LIST_TTL <= 0; using the default instead",
+                     requested=member_list_ttl,
+                     default=DEFAULT_MEMBER_LIST_TTL_SECS)
+            member_list_ttl = float(DEFAULT_MEMBER_LIST_TTL_SECS)
+        self.member_list_ttl = member_list_ttl
+        member_max_raw = os.environ.get("SLACK_MEMBER_LIST_MAX", "").strip()
+        try:
+            member_list_max = int(member_max_raw or DEFAULT_MEMBER_LIST_MAX)
+        except (TypeError, ValueError):
+            log.error("SLACK_MEMBER_LIST_MAX invalid (must be an integer)",
+                      value=member_max_raw)
+            raise SystemExit(2) from None
+        if member_list_max < 1:
+            log.warn("SLACK_MEMBER_LIST_MAX < 1; using the default instead",
+                     requested=member_list_max,
+                     default=DEFAULT_MEMBER_LIST_MAX)
+            member_list_max = DEFAULT_MEMBER_LIST_MAX
+        self.member_list_max = member_list_max
+        self._member_list_cache = _MemberListCache(
+            ttl_secs=member_list_ttl,
+            max_entries=MAX_CACHED_MEMBER_LISTS,
+        )
+
+        # Inbound attachment policy (#7087).
+        max_bytes_raw = os.environ.get("SLACK_FILE_MAX_BYTES", "").strip()
+        try:
+            file_max_bytes = int(max_bytes_raw or DEFAULT_INBOUND_FILE_MAX_BYTES)
+        except (TypeError, ValueError):
+            log.error("SLACK_FILE_MAX_BYTES invalid (must be an integer)",
+                      value=max_bytes_raw)
+            raise SystemExit(2) from None
+        if file_max_bytes < 1:
+            log.warn("SLACK_FILE_MAX_BYTES < 1; using the default instead",
+                     requested=file_max_bytes,
+                     default=DEFAULT_INBOUND_FILE_MAX_BYTES)
+            file_max_bytes = DEFAULT_INBOUND_FILE_MAX_BYTES
+        self.file_policy = SlackFilePolicy(
+            enabled=_bool_env(
+                os.environ.get("SLACK_FILE_DOWNLOADS", ""), default=True,
+            ),
+            max_bytes=file_max_bytes,
+            allowed_extensions=frozenset(
+                ext.lstrip(".").lower()
+                for ext in _split_csv(
+                    os.environ.get("SLACK_FILE_ALLOWED_EXTENSIONS", ""),
+                )
+                if ext.strip(". ")
+            ),
+            channels=tuple(_split_csv(
+                os.environ.get("SLACK_FILE_DOWNLOAD_CHANNELS", ""),
+            )),
+            excluded_channels=tuple(_split_csv(
+                os.environ.get("SLACK_FILE_DOWNLOAD_EXCLUDE_CHANNELS", ""),
+            )),
+        )
+        # `url_private_download` 302s to a login page without the bot token, so the daemon needs it to fetch what we forward.
+        # `header_rules` is the mechanism for that (matrix uses it for MSC3916 media): the daemon exact-matches the request host against these rules and attaches nothing for anything else, so the token cannot follow a member-chosen URL out of the workspace — see `fetch_headers_for` in `crates/librefang-channels/src/sidecar.rs`.
+        # The rules are only declared when attachment forwarding is on, so an operator who turns it off does not ship the token at all.
+        #
+        # Sorted so the ready event is byte-identical across runs.
+        if self.file_policy.enabled:
+            self.header_rules = [
+                (host, [["Authorization", f"Bearer {self.bot_token}"]])
+                for host in sorted(SLACK_FILE_HOSTS)
+            ]
 
         self.api_base = DEFAULT_API_BASE
         self.bot_user_id: Optional[str] = None
@@ -836,6 +1421,176 @@ class SlackAdapter(SidecarAdapter):
         if not isinstance(user_id, str) or not user_id:
             raise RuntimeError("slack auth.test missing user_id in 200 OK body")
         return user_id
+
+    def _lookup_identity(self, user_id: str) -> Optional[SlackIdentity]:
+        """Resolve one Slack user id to a human-readable identity, at most once per TTL.
+
+        Every exit path writes the cache, including the failures — an unresolvable user must cost one request, not one per message.
+        A transient failure gets the short :data:`NEGATIVE_TTL_SECS` cooldown; a definitive answer (resolved, or "no such user") gets the full TTL.
+        """
+        hit, cached = self._identity_cache.get(user_id)
+        if hit:
+            return cached
+
+        try:
+            status, body, raw = self._http(
+                f"{self.api_base}/users.info",
+                method="POST",
+                body=urllib.parse.urlencode({"user": user_id}).encode("utf-8"),
+                headers={
+                    **self._auth_headers(),
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+        except Exception as e:  # transport failure — cool down briefly, then try again
+            log.warn("slack users.info transport error", user=user_id, error=str(e))
+            self._identity_cache.put(user_id, None, ttl_secs=NEGATIVE_TTL_SECS)
+            return None
+
+        if status != 200 or not isinstance(body, dict):
+            snippet = raw[:200].decode("utf-8", "replace") if raw else ""
+            log.warn("slack users.info non-200", user=user_id, status=status, body=snippet)
+            self._identity_cache.put(user_id, None, ttl_secs=NEGATIVE_TTL_SECS)
+            return None
+
+        identity, err = parse_users_identity(body)
+        if err is not None:
+            # `missing_scope` is the one an operator most needs to see: it means the feature is switched on but the bot was never granted `users:read`, and every message will otherwise silently keep the raw id.
+            log.warn("slack users.info rejected", user=user_id, error=err)
+            self._identity_cache.put(user_id, None, ttl_secs=NEGATIVE_TTL_SECS)
+            return None
+
+        self._identity_cache.put(user_id, identity)
+        return identity
+
+    def _apply_identity(self, ev: Optional[dict]) -> Optional[dict]:
+        """Replace an inbound event's placeholder ``user_name`` (the raw ``U…`` id) with a resolved display name.
+
+        A no-op unless the operator opted in, and a no-op again whenever the lookup yields nothing — the raw id is a worse label than a real name but a better one than an empty string, and it is what every pre-#7086 deployment already shows.
+
+        The resolved handle is stamped into ``sender_username`` as well, because the same request already answered for it and the roster has a column waiting for it.
+        """
+        if not self.resolve_display_names or not isinstance(ev, dict):
+            return ev
+        params = ev.get("params")
+        if not isinstance(params, dict):
+            return ev
+        metadata = params.get("metadata")
+        user_id = metadata.get("sender_user_id") if isinstance(metadata, dict) else None
+        if not isinstance(user_id, str) or not user_id:
+            return ev
+        identity = self._lookup_identity(user_id)
+        if identity is None:
+            return ev
+        if identity.display_name:
+            params["user_name"] = identity.display_name
+        if identity.username:
+            metadata["sender_username"] = identity.username
+        return ev
+
+    def _lookup_channel_members(self, channel_id: str) -> tuple[str, ...]:
+        """Walk ``conversations.members`` for one channel, at most once per TTL.
+
+        Paginates until Slack stops handing back a cursor or :attr:`member_list_max` is reached, whichever comes first.
+        Every exit path writes the cache, failures included: a channel the bot cannot read must cost one sweep per TTL, not one per message.
+        A partial result (the cap, or a page that failed mid-walk) is cached and used — an incomplete answer to "who is in this channel?" is still an answer, and re-walking on the next message would only spend more of the same rate limit.
+        """
+        hit, cached = self._member_list_cache.get(channel_id)
+        if hit:
+            return cached
+
+        collected: list[str] = []
+        cursor: Optional[str] = None
+        while True:
+            params = {
+                "channel": channel_id,
+                "limit": str(min(MEMBER_LIST_PAGE_SIZE, self.member_list_max)),
+            }
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                status, body, raw = self._http(
+                    f"{self.api_base}/conversations.members",
+                    method="POST",
+                    body=urllib.parse.urlencode(params).encode("utf-8"),
+                    headers={
+                        **self._auth_headers(),
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                )
+            except Exception as e:  # transport failure — keep what we have, retry after the cooldown
+                log.warn("slack conversations.members transport error",
+                         channel=channel_id, error=str(e))
+                break
+
+            if status != 200 or not isinstance(body, dict):
+                snippet = raw[:200].decode("utf-8", "replace") if raw else ""
+                log.warn("slack conversations.members non-200",
+                         channel=channel_id, status=status, body=snippet)
+                break
+
+            page, cursor, err = parse_conversations_members(body)
+            if err is not None:
+                # `missing_scope` is the one an operator most needs to see: enumeration is switched on but the bot was never granted `channels:read` / `groups:read`, and every channel will otherwise silently report only the people who have spoken.
+                log.warn("slack conversations.members rejected",
+                         channel=channel_id, error=err)
+                break
+            collected.extend(page)
+            if len(collected) >= self.member_list_max:
+                log.warn("slack channel member list truncated at the configured cap",
+                         channel=channel_id, cap=self.member_list_max)
+                collected = collected[:self.member_list_max]
+                break
+            if cursor is None:
+                break
+
+        # Sorted so the metadata the daemon receives is byte-identical across sweeps that return the same people in a different page order.
+        # The list reaches an LLM prompt through `channel_members`, where an unstable order invalidates the provider prompt cache on unchanged content (#3298).
+        members = tuple(sorted(set(collected)))
+        ttl = None if members else NEGATIVE_TTL_SECS
+        self._member_list_cache.put(channel_id, members, ttl_secs=ttl)
+        return members
+
+    def _apply_enumerated_members(self, ev: Optional[dict]) -> Optional[dict]:
+        """Stamp the channel's full member list onto an inbound group event as ``group_members`` metadata (#7086).
+
+        This is the bulk half of the roster the reporter asked for: ``channel_members`` could only ever report people who had spoken, because the per-sender upsert was the only thing writing rows.
+
+        The daemon stores what lands here as ``source = 'enumerated'``, deliberately apart from the observational rows, so ``channel_dm`` still refuses anyone who has never addressed the agent.
+        Widening the DM authorization set is the failure mode this whole shape exists to avoid, and it would be invisible from here — the adapter cannot tell what the daemon does with the key, which is exactly why the split lives on the daemon side and not in this file.
+
+        Display names come from the identity cache only; **no ``users.info`` call is made on this path**.
+        A sweep is bulk by nature, and resolving 500 members would spend the workspace's entire per-method budget to name people who have never spoken.
+        Anyone who has spoken is already cached by :meth:`_apply_identity`, so in practice the people an agent can act on carry names and the rest carry ids until they say something.
+        """
+        if not self.enumerate_members or not isinstance(ev, dict):
+            return ev
+        params = ev.get("params")
+        if not isinstance(params, dict) or params.get("is_group") is not True:
+            return ev
+        channel_id = params.get("user_id")
+        if not isinstance(channel_id, str) or not channel_id:
+            return ev
+        member_ids = self._lookup_channel_members(channel_id)
+        if not member_ids:
+            return ev
+        metadata = params.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            params["metadata"] = metadata
+
+        members: list[dict] = []
+        for member_id in member_ids:
+            entry: dict[str, Any] = {"user_id": member_id, "display_name": member_id}
+            _, identity = self._identity_cache.get(member_id)
+            if identity is not None:
+                if identity.display_name:
+                    entry["display_name"] = identity.display_name
+                if identity.username:
+                    entry["username"] = identity.username
+            members.append(entry)
+        metadata["group_members"] = members
+        return ev
 
     def _fetch_socket_mode_url(self) -> str:
         status, body, raw = self._http(
@@ -1219,9 +1974,11 @@ class SlackAdapter(SidecarAdapter):
                 bot_user_id=self.bot_user_id,
                 allowed_channels=self.allowed_channels,
                 account_id=self.account_id,
+                file_policy=self.file_policy,
             )
             if ev is None:
                 return
+            ev = self._apply_enumerated_members(self._apply_identity(ev))
             # No reaction here (#6731). Receiving a message is not the same as answering it: the daemon may decline the turn for any of ~two dozen reasons (mention-only group gating, an `[allowed_channels]`-adjacent RBAC denial, a per-user rate limit, a slash command it handles itself), all of which return before any adapter-visible lifecycle signal.
             # The receipt is added from the `queued` phase in `_on_phase` instead, which fires only for a turn that is actually run.
             emit(ev)
@@ -1239,7 +1996,7 @@ class SlackAdapter(SidecarAdapter):
                 account_id=self.account_id,
             )
             if ev is not None:
-                emit(ev)
+                emit(self._apply_enumerated_members(self._apply_identity(ev)))
             return
         # Unknown envelope types — slack adds new ones occasionally
         # (slash_commands, etc.). Forward-compat: log and ignore.

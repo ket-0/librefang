@@ -199,6 +199,27 @@ describe("ChannelsPage", () => {
     expect(screen.getByText("channels.connect_first")).toBeInTheDocument();
   });
 
+  // The gear was gated on `category !== "sidecar"` while every channel reports
+  // `category: "sidecar"`, so the test was never true and the button never
+  // rendered — leaving `POST /api/channels/sidecar/{name}/configure` (#5252)
+  // unreachable from the UI for an already-configured sidecar (#7892).
+  // Assert on the rendered button rather than on the gate, so the same class of
+  // dead condition cannot come back unnoticed.
+  it("renders the configure gear for a sidecar channel", () => {
+    useChannelsMock.mockReturnValue(makeQuery([makeChannel()]));
+    renderPage();
+    expect(screen.getByLabelText("channels.config")).toBeTruthy();
+  });
+
+  it("opens the sidecar configure drawer when the gear is clicked", async () => {
+    useChannelsMock.mockReturnValue(makeQuery([makeChannel()]));
+    renderPage();
+    fireEvent.click(screen.getByLabelText("channels.config"));
+    await waitFor(() => {
+      expect(useDrawerStore.getState().isOpen).toBe(true);
+    });
+  });
+
   it("lists configured channels and hides unconfigured ones by default", () => {
     useChannelsMock.mockReturnValue(
       makeQuery<ChannelItem[]>([
@@ -362,10 +383,78 @@ describe("ChannelsPage", () => {
     expect(
       within(drawer).getByText("channels.schema_unavailable_title"),
     ).toBeInTheDocument();
+    // The reason-carrying copy, not the no-reason variant: the two hints differ
+    // in what they tell the operator to do (fix the error below vs. edit
+    // config.toml by hand), so the branch has to be pinned from both sides.
+    expect(
+      within(drawer).getByText("channels.schema_unavailable_hint"),
+    ).toBeInTheDocument();
+    expect(
+      within(drawer).queryByText("channels.schema_unavailable_hint_no_reason"),
+    ).not.toBeInTheDocument();
     // Save is dead — there is nothing to submit.
     expect(
       within(drawer).getByRole("button", { name: /common\.save/ }),
     ).toBeDisabled();
+  });
+
+  it("shows the SDK version the sidecar adapter reported, and nothing when it reported none", () => {
+    // #7140: a Telegram sidecar ran a four-month-old librefang-sdk against a
+    // current daemon and the only way to find that out was shelling into the
+    // host. The configure drawer is where an operator is already looking at
+    // that adapter.
+    useChannelsMock.mockReturnValue(
+      makeQuery<ChannelItem[]>([
+        makeChannel({ name: "slack" }),
+        makeChannel({
+          name: "telegram",
+          display_name: "Telegram",
+          configured: false,
+          sdk_version: "2026.3.2201",
+          fields: [
+            {
+              key: "TELEGRAM_BOT_TOKEN",
+              label: "Bot token",
+              type: "secret",
+              required: true,
+            },
+          ],
+        }),
+        makeChannel({
+          name: "wechat",
+          display_name: "WeChat",
+          configured: false,
+          // An SDK too old to report a version is exactly the deployment this
+          // line exists to expose, so it must read as "unknown" — an absent
+          // line — rather than borrowing another adapter's number.
+          fields: [
+            {
+              key: "WECHAT_BOT_TOKEN",
+              label: "Bot token",
+              type: "secret",
+              required: true,
+            },
+          ],
+        }),
+      ]),
+    );
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /channels\.add/ }));
+    let drawer = screen.getByTestId("drawer-slot");
+    fireEvent.click(within(drawer).getByText("Telegram"));
+    drawer = screen.getByTestId("drawer-slot");
+    expect(within(drawer).getByTestId("sidecar-sdk-version")).toHaveTextContent(
+      "2026.3.2201",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /common\.cancel/ }));
+    fireEvent.click(screen.getByRole("button", { name: /channels\.add/ }));
+    drawer = screen.getByTestId("drawer-slot");
+    fireEvent.click(within(drawer).getByText("WeChat"));
+    drawer = screen.getByTestId("drawer-slot");
+    expect(
+      within(drawer).queryByTestId("sidecar-sdk-version"),
+    ).not.toBeInTheDocument();
   });
 
   it("forwards the schema-driven values to useSaveSidecarConfig on Save", () => {
@@ -377,6 +466,11 @@ describe("ChannelsPage", () => {
           name: "telegram",
           display_name: "Telegram",
           configured: false,
+          // Discovery rows never carry `channel_type` on the wire (only
+          // configured rows do) — `makeChannel`'s default is a leftover
+          // from its "slack" base, so it's overridden here to match a real
+          // discovery row shape and get the right instance-name default.
+          channel_type: undefined,
           fields: [
             {
               key: "TELEGRAM_BOT_TOKEN",
@@ -401,6 +495,7 @@ describe("ChannelsPage", () => {
     expect(arg).toMatchObject({
       name: "telegram",
       values: { TELEGRAM_BOT_TOKEN: "abc-123" },
+      instanceName: "telegram",
     });
   });
 
@@ -413,6 +508,7 @@ describe("ChannelsPage", () => {
           name: "telegram",
           display_name: "Telegram",
           configured: false,
+          channel_type: undefined,
           fields: [{ key: "TOKEN", label: "Token", type: "secret" }],
         }),
       ]),
@@ -523,6 +619,149 @@ describe("ChannelsPage", () => {
     expect(
       within(drawer).getByPlaceholderText(/set — leave blank|channels\.secret_set_placeholder/i),
     ).toBeInTheDocument();
+  });
+
+  // #8063 fixtures: a configured Slack instance whose `[[sidecar_channels]]`
+  // name (`slack-hr`) is NOT its adapter name (`slack`). Every save-path test
+  // before this one drove a *discovery* row, where the two are the same string,
+  // so nothing covered the pair of defects the issue reported — an edit form
+  // with no fields in it, and a Save addressed by instance name.
+  function slackHrFields(): ChannelItem["fields"] {
+    return [
+      {
+        key: "SLACK_APP_TOKEN",
+        label: "App Token (xapp-)",
+        type: "secret",
+        required: true,
+        has_value: true,
+      },
+      {
+        key: "SLACK_ALLOWED_CHANNELS",
+        label: "Allowed Channel IDs",
+        type: "text",
+        value: "C0123",
+        has_value: true,
+      },
+      {
+        key: "SLACK_FILE_DOWNLOADS",
+        label: "Forward uploaded files",
+        type: "bool",
+        value: "true",
+        has_value: true,
+      },
+      {
+        key: "SLACK_ACCOUNT_ID",
+        label: "Account ID",
+        type: "text",
+        advanced: true,
+      },
+    ];
+  }
+
+  function slackHrChannel(overrides: Partial<ChannelItem> = {}): ChannelItem {
+    return makeChannel({
+      name: "slack-hr",
+      display_name: "slack-hr",
+      channel_type: "slack",
+      configured: true,
+      fields: slackHrFields(),
+      ...overrides,
+    });
+  }
+
+  it("renders the editable schema fields for a configured instance whose name differs from its channel type", () => {
+    useChannelsMock.mockReturnValue(makeQuery<ChannelItem[]>([slackHrChannel()]));
+    renderPage();
+    fireEvent.click(screen.getByLabelText("channels.config"));
+    const drawer = screen.getByTestId("drawer-slot");
+
+    // The reported symptom was a drawer holding nothing but the
+    // config_template toggle and Cancel/Save. Assert the non-secret fields
+    // the issue names are actually rendered and carry their stored values.
+    expect(within(drawer).getByText("Allowed Channel IDs")).toBeInTheDocument();
+    expect(within(drawer).getByDisplayValue("C0123")).toBeInTheDocument();
+    expect(within(drawer).getByText("Forward uploaded files")).toBeInTheDocument();
+    expect(within(drawer).getByDisplayValue("true")).toBeInTheDocument();
+    expect(within(drawer).getByText("App Token (xapp-)")).toBeInTheDocument();
+    // Advanced fields stay behind the toggle, which must be present whenever
+    // any exist — the issue suspected the whole form was gated this way.
+    expect(within(drawer).queryByText("Account ID")).not.toBeInTheDocument();
+    fireEvent.click(within(drawer).getByText("common.show_advanced"));
+    expect(within(drawer).getByText("Account ID")).toBeInTheDocument();
+
+    // Nothing inert: there is something to edit, so Save is live.
+    expect(
+      within(drawer).getByRole("button", { name: /common\.save/ }),
+    ).toBeEnabled();
+  });
+
+  it("saves a configured instance under its adapter name, not its instance name", () => {
+    const { save } = setMutationDefaults();
+    useChannelsMock.mockReturnValue(makeQuery<ChannelItem[]>([slackHrChannel()]));
+    renderPage();
+    fireEvent.click(screen.getByLabelText("channels.config"));
+    const drawer = screen.getByTestId("drawer-slot");
+    fireEvent.change(within(drawer).getByDisplayValue("C0123"), {
+      target: { value: "C0999" },
+    });
+    fireEvent.click(within(drawer).getByRole("button", { name: /common\.save/ }));
+
+    expect(save.mutate).toHaveBeenCalledTimes(1);
+    const [arg] = save.mutate.mock.calls[0];
+    // `name` keys the endpoint path. Sending the instance name here is what
+    // produced the issue's `404 no sidecar adapter named 'slack-hr'` — the
+    // catalog only knows `slack`.
+    expect(arg.name).toBe("slack");
+    expect(arg.instanceName).toBe("slack-hr");
+    expect(arg.values).toEqual({
+      SLACK_ALLOWED_CHANNELS: "C0999",
+      SLACK_FILE_DOWNLOADS: "true",
+    });
+    // A secret left blank stays out of the payload so the daemon keeps the
+    // stored token instead of being asked to write an empty one.
+    expect(arg.values).not.toHaveProperty("SLACK_APP_TOKEN");
+  });
+
+  it("disables Save for a configured instance with no schema fields even when the daemon sent no reason", () => {
+    const { save } = setMutationDefaults();
+    useChannelsMock.mockReturnValue(
+      makeQuery<ChannelItem[]>([slackHrChannel({ fields: [], schema_error: undefined })]),
+    );
+    renderPage();
+    fireEvent.click(screen.getByLabelText("channels.config"));
+    const drawer = screen.getByTestId("drawer-slot");
+    const saveButton = within(drawer).getByRole("button", { name: /common\.save/ });
+    // There is no cached schema behind this row, so the configure endpoint
+    // could only answer 503 — the button must not pretend otherwise.
+    expect(saveButton).toBeDisabled();
+    fireEvent.click(saveButton);
+    expect(save.mutate).not.toHaveBeenCalled();
+    // A disabled button with no explanation is the same dead end the issue
+    // reported, just quieter. `schema_error` is keyed per catalog adapter, so
+    // a custom `[[sidecar_channels]]` type never has one — the drawer must
+    // still say why it is empty and where to configure the instance instead.
+    expect(
+      within(drawer).getByText("channels.schema_unavailable_title"),
+    ).toBeInTheDocument();
+    expect(
+      within(drawer).getByText("channels.schema_unavailable_hint_no_reason"),
+    ).toBeInTheDocument();
+  });
+
+  it("closes the configure drawer on Cancel without saving", async () => {
+    const { save } = setMutationDefaults();
+    useChannelsMock.mockReturnValue(makeQuery<ChannelItem[]>([slackHrChannel()]));
+    renderPage();
+    fireEvent.click(screen.getByLabelText("channels.config"));
+    let drawer = screen.getByTestId("drawer-slot");
+    fireEvent.change(within(drawer).getByDisplayValue("C0123"), {
+      target: { value: "C0999" },
+    });
+    drawer = screen.getByTestId("drawer-slot");
+    fireEvent.click(within(drawer).getByRole("button", { name: /common\.cancel/ }));
+
+    await waitFor(() => expect(useDrawerStore.getState().isOpen).toBe(false));
+    expect(save.mutate).not.toHaveBeenCalled();
   });
 
   it("offers the copyable config_template snippet inside the SidecarForm drawer", () => {

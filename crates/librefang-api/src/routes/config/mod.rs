@@ -282,13 +282,17 @@ fn llm_health_snapshot(state: &AppState) -> LlmHealthSnapshot {
 
 /// Strip embedded `user:pass@` credentials from a URL, keeping host/port.
 ///
-/// Used for telemetry / OTLP endpoints that may legitimately contain a
-/// basic-auth tuple in the URL. Returns the input unchanged when no `@`
-/// follows the scheme — i.e. when there is nothing to redact.
+/// Used for configured endpoints, including pairing and OTLP, that may
+/// legitimately contain a basic-auth tuple in the URL. Returns the input
+/// unchanged when the authority has no `@` delimiter.
 fn redact_url_credentials(url: &str) -> String {
     if let Some(scheme_end) = url.find("://") {
         let after_scheme = &url[scheme_end + 3..];
-        if let Some(at_pos) = after_scheme.find('@') {
+        let authority_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        if let Some(at_pos) = authority.rfind('@') {
             let host_and_rest = &after_scheme[at_pos..]; // includes '@'
             return format!("{}://***{}", &url[..scheme_end], host_and_rest);
         }
@@ -352,6 +356,10 @@ pub fn ui_sections_overlay() -> serde_json::Value {
                 "max_cron_jobs", "agent_max_iterations", "workspaces_dir",
                 // Newly surfaced root-level scalars (#4678).
                 "update_channel", "max_history_messages", "max_upload_size_bytes",
+                // Fleet-wide fallback owner for artifacts created without an
+                // authenticated caller (#7744). Root-level scalar, so it renders here
+                // rather than as its own section.
+                "default_owner",
                 "max_concurrent_bg_llm", "max_agent_call_depth", "max_request_body_bytes",
                 "workflow_stale_timeout_minutes", "workflow_default_total_timeout_secs",
                 "tool_timeout_secs",
@@ -396,6 +404,7 @@ pub fn ui_sections_overlay() -> serde_json::Value {
         {"key": "links", "struct_field": "links"},
         {"key": "reload", "struct_field": "reload"},
         {"key": "budget", "struct_field": "budget"},
+        {"key": "usage", "struct_field": "usage"},
         {"key": "thinking", "struct_field": "thinking"},
         {"key": "pairing", "struct_field": "pairing"},
         {"key": "broadcast", "struct_field": "broadcast"},
@@ -846,38 +855,104 @@ fn is_writable_config_path(path: &str) -> bool {
 
     // Within an allowed section, refuse keys that obviously carry secrets or
     // override security-critical knobs even if the operator points us at one
-    // of the curated sections by name.
-    const SCRUB_SUFFIXES: &[&str] = &[
-        ".api_key",
-        ".token",
-        ".secret",
-        ".shared_secret",
-        ".password",
-        ".bypass",
-        ".admin",
-        ".owner",
-        // Round-4 review of #4678: env-var-name redirects. Codebase
-        // pervasively uses `*_token_env`, `*_password_env`,
-        // `*_secret_env`, `*_client_secret_env`, `*_api_key_env`,
-        // `bot_token_env`, `access_token_env`, `cdp_auth_token_env`.
-        // The original SCRUB only blocked literal `.api_key` etc., so
-        // an attacker could repoint `<section>.api_key_env` at any env
-        // var the daemon has access to and force a credential rotation
-        // through a logged channel. The blanket `_env` suffix catches
-        // every variant the workspace currently uses (verified by grep
-        // against librefang-types/src/config/types.rs).
-        "_env",
+    // of the curated sections by name. The check is on the path's final
+    // segment, which is what the caller is actually assigning.
+    if path.rsplit('.').next().is_some_and(is_scrubbed_config_key) {
+        return false;
+    }
+    true
+}
+
+/// True when `key` is the name of a config field that `POST /api/config/set`
+/// must never assign, because it carries a credential, redirects the env var a
+/// credential is resolved from, or grants privilege.
+///
+/// This is the single source of truth for both halves of the scrub: the path
+/// check in [`is_writable_config_path`] applies it to a path's final segment,
+/// and [`scrubbed_key_in_payload`] applies it to every key inside a submitted
+/// JSON payload. Keeping one predicate is the point — a new entry here closes
+/// the leaf path and the wholesale-table payload at the same time, instead of
+/// closing one and leaving the other open (#8085).
+pub(crate) fn is_scrubbed_config_key(key: &str) -> bool {
+    // Exact field names. Matched exactly rather than by suffix so that
+    // `shared_secret` is caught by its own entry and a field like `bot_token`
+    // is not caught by `token` — which is the behaviour the path check has had
+    // since round-4 of #4678, preserved here deliberately.
+    const SCRUB_KEYS: &[&str] = &[
+        "api_key",
+        "token",
+        "secret",
+        "shared_secret",
+        "password",
+        "bypass",
+        "admin",
+        "owner",
         // OAuth public identity that's safe to *display* but not safe
         // to mutate (issuer redirect / consent skipping). External
         // auth sections are mostly off the prefix list now, but defense
         // in depth in case anything slips through a writable section.
-        ".client_id",
-        ".client_secret",
+        "client_id",
+        "client_secret",
     ];
-    if SCRUB_SUFFIXES.iter().any(|s| path.ends_with(s)) {
-        return false;
+    // Round-4 review of #4678: env-var-name redirects. Codebase
+    // pervasively uses `*_token_env`, `*_password_env`,
+    // `*_secret_env`, `*_client_secret_env`, `*_api_key_env`,
+    // `bot_token_env`, `access_token_env`, `cdp_auth_token_env`.
+    // The original SCRUB only blocked literal `api_key` etc., so
+    // an attacker could repoint `<section>.api_key_env` at any env
+    // var the daemon has access to and force a credential rotation
+    // through a logged channel. The blanket `_env` suffix catches
+    // every variant the workspace currently uses (verified by grep
+    // against librefang-types/src/config/types.rs).
+    const SCRUB_KEY_SUFFIXES: &[&str] = &["_env"];
+
+    SCRUB_KEYS.contains(&key) || SCRUB_KEY_SUFFIXES.iter().any(|s| key.ends_with(s))
+}
+
+/// Return the first credential-shaped key found anywhere inside `value`, at any
+/// depth, or `None` when the payload carries none.
+///
+/// The path check alone is not enough. A writable section prefix accepts a
+/// write one level below the section (`segments == 1 || segments == 2` in
+/// [`is_writable_config_path`]), and at that depth the handler assigns the
+/// submitted JSON *wholesale* — `doc[section][key] = <value>`. So a caller can
+/// post an entire table at a path whose own name is innocuous and smuggle a
+/// scrubbed field in as one of its members:
+///
+/// ```text
+/// POST /api/config/set
+/// {"path": "media.custom_stt",
+///  "value": {"api_key_env": "ANTHROPIC_API_KEY", "base_url": "http://attacker/"}}
+/// ```
+///
+/// `media.custom_stt` ends in neither a scrubbed name nor `_env`, so the path
+/// check passes and the `api_key_env` redirect lands. That is the same defect
+/// class round-4 of #4678 removed `sidecar_channels` / `fallback_providers` /
+/// `taint_rules` from the allowlist for, and that
+/// `WRITABLE_DEPTH_2_ONLY_PREFIXES` forces per-leaf writes for under
+/// `channels.` — both of which are enumerations of known-bad prefixes rather
+/// than a rule, so every newly struct-typed config field reopened the hole.
+/// Scanning the payload closes it once for every section (#8085).
+///
+/// Legitimate per-field edits are unaffected: the same field is still writable
+/// one level deeper (`media.custom_stt.base_url`), where the path check governs
+/// it as it always has.
+pub(crate) fn scrubbed_key_in_payload(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, inner) in map {
+                if is_scrubbed_config_key(key) {
+                    return Some(key.clone());
+                }
+                if let Some(found) = scrubbed_key_in_payload(inner) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(scrubbed_key_in_payload),
+        _ => None,
     }
-    true
 }
 
 /// Convert a serde_json::Value to a toml_edit::Value (format-preserving).
@@ -1099,7 +1174,7 @@ async fn dashboard_snapshot_compute(state: &Arc<AppState>) -> serde_json::Value 
         "memory_used_mb": memory_used_mb,
         "default_provider": cfg.default_model.provider,
         "default_model": cfg.default_model.model,
-        "config_exists": state.kernel.home_dir().join("config.toml").exists(),
+        "config_exists": state.kernel.config_path().exists(),
         "api_listen": cfg.api_listen,
         "home_dir": state.kernel.home_dir().display().to_string(),
         "log_level": cfg.log_level,
@@ -1138,9 +1213,7 @@ async fn dashboard_snapshot_compute(state: &Arc<AppState>) -> serde_json::Value 
     static SKILL_COUNT_CACHE: std::sync::Mutex<Option<(usize, std::time::Instant)>> =
         std::sync::Mutex::new(None);
     let skill_count = {
-        let cached = SKILL_COUNT_CACHE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        let cached = lock_skill_count_cache(&SKILL_COUNT_CACHE)
             .as_ref()
             .and_then(|(n, t)| {
                 if t.elapsed() < std::time::Duration::from_secs(30) {
@@ -1162,8 +1235,7 @@ async fn dashboard_snapshot_compute(state: &Arc<AppState>) -> serde_json::Value 
                     .read()
                     .map(|r| r.list().len())
                     .unwrap_or(0);
-                *SKILL_COUNT_CACHE.lock().unwrap_or_else(|p| p.into_inner()) =
-                    Some((n, std::time::Instant::now()));
+                *lock_skill_count_cache(&SKILL_COUNT_CACHE) = Some((n, std::time::Instant::now()));
                 n
             }
         }
@@ -1193,6 +1265,41 @@ async fn dashboard_snapshot_compute(state: &Arc<AppState>) -> serde_json::Value 
         "workflowCount": workflow_count,
         "webSearchAvailable": web_search_available,
     })
+}
+
+fn lock_skill_count_cache<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("dashboard skill count cache lock poisoned; recovering cached value");
+        mutex.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+#[cfg(test)]
+mod skill_count_cache_lock_tests {
+    use super::lock_skill_count_cache;
+    use std::sync::Mutex;
+
+    #[test]
+    fn poisoned_cache_lock_recovers_preserved_value_and_remains_usable() {
+        let cache = Mutex::new(Some(7usize));
+        let poison = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut value = cache.lock().unwrap();
+                    *value = Some(11);
+                    panic!("poison skill count cache lock");
+                })
+                .join()
+        });
+        assert!(poison.is_err());
+        assert!(cache.is_poisoned());
+        assert_eq!(*lock_skill_count_cache(&cache), Some(11));
+        assert!(!cache.is_poisoned());
+
+        *lock_skill_count_cache(&cache) = Some(13);
+        assert_eq!(*cache.lock().unwrap(), Some(13));
+    }
 }
 
 #[cfg(test)]
@@ -1480,6 +1587,14 @@ url = "https://search.example.com"
         assert!(!super::is_writable_config_path(
             "external_auth.require_email_verified"
         ));
+        // #7744: `role_map` is what turns a signed ID token into an API credential, so a caller who could write it could grant themselves Owner by naming an IdP group they already hold.
+        assert!(!super::is_writable_config_path("external_auth.role_map"));
+        // #7746: same reasoning for the group side. Writing `group_map` would
+        // let a caller join themselves to any team — and a team owns artifacts
+        // and confers binding-rule role strings — while writing `claim_paths`
+        // would let them redirect both maps at a claim they control.
+        assert!(!super::is_writable_config_path("external_auth.group_map"));
+        assert!(!super::is_writable_config_path("external_auth.claim_paths"));
         assert!(!super::is_writable_config_path("oauth.google_client_id"));
         assert!(!super::is_writable_config_path("audit.anchor_path"));
         assert!(!super::is_writable_config_path("audit.retention_days"));
@@ -1644,5 +1759,99 @@ mod migrate_roots_tests {
             false,
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod scrub_payload_tests {
+    use super::{is_scrubbed_config_key, is_writable_config_path, scrubbed_key_in_payload};
+
+    /// The refactor that introduced `is_scrubbed_config_key` must not have moved
+    /// the path check's boundary. Each case below is the behaviour the dotted
+    /// `SCRUB_SUFFIXES` list had: the final segment is matched exactly, so
+    /// `shared_secret` is caught by its own entry while `bot_token` — which no
+    /// entry names — is not.
+    #[test]
+    fn path_scrub_boundary_is_unchanged_by_the_shared_predicate() {
+        for closed in [
+            "media.api_key",
+            "media.custom_stt.api_key_env",
+            "web.brave.token",
+            "llm.shared_secret",
+            "queue.admin",
+            "skills.client_secret",
+        ] {
+            assert!(
+                !is_writable_config_path(closed),
+                "`{closed}` must stay closed"
+            );
+        }
+        for open in [
+            "media.custom_stt.base_url",
+            "web.search_provider",
+            "queue.concurrency.trigger_lane",
+        ] {
+            assert!(is_writable_config_path(open), "`{open}` must stay writable");
+        }
+        // Not named by any entry, and not caught by a suffix — unchanged from
+        // the pre-#8085 behaviour, and called out in the PR rather than widened
+        // here, because widening would change which paths are writable.
+        assert!(is_scrubbed_config_key("api_key_env"));
+        assert!(!is_scrubbed_config_key("bot_token"));
+    }
+
+    /// The scan has to find a scrubbed key wherever it sits, because the handler
+    /// assigns the whole submitted value at the path.
+    #[test]
+    fn payload_scan_finds_a_credential_key_at_every_depth() {
+        let cases = [
+            serde_json::json!({"api_key_env": "X"}),
+            serde_json::json!({"outer": {"api_key_env": "X"}}),
+            serde_json::json!({"outer": {"inner": {"token": "X"}}}),
+            serde_json::json!([{"client_secret": "X"}]),
+            serde_json::json!({"list": [{"password": "X"}]}),
+            serde_json::json!({"a": 1, "shared_secret": "X"}),
+        ];
+        for case in cases {
+            assert!(
+                scrubbed_key_in_payload(&case).is_some(),
+                "must be caught: {case}"
+            );
+        }
+    }
+
+    /// A payload with nothing credential-shaped must pass, or the scan would be
+    /// a blanket ban on object-valued writes and would break the primitive
+    /// collection sections (`provider_urls`, `tool_timeouts`, …) that round-4
+    /// of #4678 deliberately opened.
+    #[test]
+    fn payload_scan_passes_a_clean_payload() {
+        let cases = [
+            serde_json::json!({"base_url": "http://localhost/", "model": "m"}),
+            serde_json::json!({"openai": "http://localhost:9001/v1"}),
+            serde_json::json!({"nested": {"voice": "alloy", "format": "mp3"}}),
+            serde_json::json!("a plain string"),
+            serde_json::json!(7),
+            serde_json::json!(null),
+            serde_json::json!([1, 2, 3]),
+        ];
+        for case in cases {
+            assert_eq!(
+                scrubbed_key_in_payload(&case),
+                None,
+                "must pass cleanly: {case}"
+            );
+        }
+    }
+
+    /// The reported key is the one the operator has to go and edit, so it must
+    /// be the offending name rather than the first key seen.
+    #[test]
+    fn payload_scan_reports_the_offending_key_name() {
+        let value = serde_json::json!({"base_url": "http://a/", "api_key_env": "X"});
+        assert_eq!(
+            scrubbed_key_in_payload(&value).as_deref(),
+            Some("api_key_env")
+        );
     }
 }

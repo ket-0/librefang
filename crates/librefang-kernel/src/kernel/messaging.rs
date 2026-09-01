@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use librefang_channels::types::SenderContext;
 use librefang_runtime::agent_loop::{run_agent_loop, AgentLoopResult};
+use librefang_skills::SkillError;
 use librefang_types::agent::{AgentId, AgentState, SessionId};
 use librefang_types::error::LibreFangError;
 use tracing::info;
@@ -135,12 +136,15 @@ impl LibreFangKernel {
     }
 
     /// Send a multimodal message with sender identity context from a channel.
+    ///
+    /// `thinking_override` follows [`Self::send_message_with_thinking_override`]: the channel bridge resolves it per conversation from `/think` (#7140).
     pub async fn send_message_with_blocks_and_sender(
         &self,
         agent_id: AgentId,
         message: &str,
         blocks: Vec<librefang_types::message::ContentBlock>,
         sender: &SenderContext,
+        thinking_override: Option<bool>,
     ) -> KernelResult<AgentLoopResult> {
         self.send_message_full(
             agent_id,
@@ -149,7 +153,7 @@ impl LibreFangKernel {
             Some(blocks),
             Some(sender),
             None,
-            None,
+            thinking_override,
             None,
         )
         .await
@@ -195,7 +199,7 @@ impl LibreFangKernel {
             None,
             None,
             None,
-            None,
+            librefang_types::config::ThinkingOverride::Inherit,
             None,
             upstream,
             false,
@@ -229,7 +233,7 @@ impl LibreFangKernel {
             None,
             None,
             None,
-            None,
+            librefang_types::config::ThinkingOverride::Inherit,
             Some(session_id),
             upstream,
             false,
@@ -309,7 +313,7 @@ impl LibreFangKernel {
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         sender_context: Option<&SenderContext>,
-        thinking_override: Option<bool>,
+        thinking_override: librefang_types::config::ThinkingOverride,
         session_id_override: Option<SessionId>,
         incognito: bool,
         owner: Option<librefang_types::agent::UserId>,
@@ -651,14 +655,18 @@ impl LibreFangKernel {
 
         let driver = self.resolve_driver_for_owner(&manifest, owner)?;
 
-        // Resolve the context window: agent.toml override > catalog (#6568).
+        // Resolve the context window: agent.toml override > per-model operator
+        // override > catalog (#6568, #7774).
         // The ephemeral `/btw` session is created empty below, so it carries no
         // persisted hint to fall back to.
+        // Only the size reaches the agent loop; the layer that produced it is
+        // reported by the context report, not consumed here (#7774).
         let ctx_window = super::manifest_helpers::resolve_context_window(
             &self.llm.model_catalog.load(),
             &manifest.model,
             None,
-        );
+        )
+        .map(|resolved| resolved.tokens);
 
         // Inject model_supports_tools for auto web search augmentation.
         // Refs #4745: honour user-configured per-model capability overrides
@@ -732,6 +740,7 @@ impl LibreFangKernel {
                 interrupt: Some(librefang_runtime::interrupt::SessionInterrupt::new()),
                 max_iterations: self.config.load().agent_max_iterations,
                 max_history_messages: self.config.load().max_history_messages,
+                memory_fact_budget_percent: self.config.load().memory_fact_budget_percent,
                 aux_client: Some(self.llm.aux_client.load_full()),
                 parent_session_id: None,
                 // Ephemeral /btw sessions start with empty history so no
@@ -754,6 +763,11 @@ impl LibreFangKernel {
                 canvas_config: Some(self.config.load().canvas.clone()),
                 // Ephemeral /btw is a user-initiated turn, not a system fork.
                 system_call: false,
+                // #7744: `/btw` runs on an empty ephemeral session and the
+                // path carries no authenticated owner (its callers pass
+                // `None`). Anything it creates is recorded unowned rather
+                // than attributed to the agent that ran it.
+                acting_principal: None,
             },
         )
         .await
@@ -807,6 +821,9 @@ impl LibreFangKernel {
             user_id: billed_user_id,
             channel: None,
             session_id: None,
+            // #7714: an ephemeral turn on a spawned worker still spends on
+            // its spawner's behalf, so it rolls up the same way as a full turn.
+            billed_agent_id: Some(crate::kernel::agent_execution::billed_agent_for(&entry)),
         };
         if let Err(e) = self.metering.engine.check_all_and_record(
             &usage_record,
@@ -930,7 +947,10 @@ impl LibreFangKernel {
             content_blocks,
             sender_context,
             session_mode_override,
-            thinking_override,
+            // Every caller of this entry point predates #7946 and passes the
+            // legacy boolean; the mode-carrying variants reach
+            // `send_message_full_with_upstream` directly.
+            thinking_override.into(),
             session_id_override,
             None,
             false,
@@ -961,7 +981,7 @@ impl LibreFangKernel {
         content_blocks: Option<Vec<librefang_types::message::ContentBlock>>,
         sender_context: Option<&SenderContext>,
         session_mode_override: Option<librefang_types::agent::SessionMode>,
-        thinking_override: Option<bool>,
+        thinking_override: librefang_types::config::ThinkingOverride,
         session_id_override: Option<SessionId>,
         upstream_interrupt: Option<librefang_runtime::interrupt::SessionInterrupt>,
         incognito: bool,
@@ -994,7 +1014,7 @@ impl LibreFangKernel {
         content_blocks: Option<Vec<librefang_types::message::ContentBlock>>,
         sender_context: Option<&SenderContext>,
         session_mode_override: Option<librefang_types::agent::SessionMode>,
-        thinking_override: Option<bool>,
+        thinking_override: librefang_types::config::ThinkingOverride,
         session_id_override: Option<SessionId>,
         upstream_interrupt: Option<librefang_runtime::interrupt::SessionInterrupt>,
         incognito: bool,
@@ -1668,8 +1688,15 @@ impl LibreFangKernel {
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
     )> {
         let handle = kernel_handle.unwrap_or_else(|| self.kernel_handle());
-        self.send_message_streaming_resolved(agent_id, message, handle, None, None, None)
-            .await
+        self.send_message_streaming_resolved(
+            agent_id,
+            message,
+            handle,
+            None,
+            librefang_types::config::ThinkingOverride::Inherit,
+            None,
+        )
+        .await
     }
 
     /// Streaming variant with an explicit session ID override.
@@ -1692,7 +1719,7 @@ impl LibreFangKernel {
             message,
             handle,
             None,
-            None,
+            librefang_types::config::ThinkingOverride::Inherit,
             session_id_override,
         )
         .await
@@ -1719,6 +1746,7 @@ impl LibreFangKernel {
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         sender_context: Option<&SenderContext>,
+        thinking_override: librefang_types::config::ThinkingOverride,
         session_id_override: Option<SessionId>,
         incognito: bool,
         owner: Option<librefang_types::agent::UserId>,
@@ -1738,6 +1766,7 @@ impl LibreFangKernel {
             interrupt: Some(session_interrupt),
             max_iterations: self.config.load().agent_max_iterations,
             max_history_messages: self.config.load().max_history_messages,
+            memory_fact_budget_percent: self.config.load().memory_fact_budget_percent,
             aux_client: Some(self.llm.aux_client.load_full()),
             parent_session_id: None,
             tool_results_config: Some(self.config.load().tool_results.clone()),
@@ -1750,33 +1779,21 @@ impl LibreFangKernel {
             canvas_config: Some(self.config.load().canvas.clone()),
             // User-initiated main turn, not a system-internal fork.
             system_call: false,
+            // #7744: resolved in `send_message_streaming_with_sender_and_opts`,
+            // the first point where this agent's manifest is in hand — the
+            // same place `compaction_config` above is filled in.
+            acting_principal: None,
         };
         self.send_message_streaming_with_sender_and_opts(
             effective_id,
             message,
             handle,
             sender_context,
-            None,
+            thinking_override,
             session_id_override,
             loop_opts,
             owner,
         )
-    }
-
-    /// Sender-aware streaming entry point for channel bridges.
-    pub async fn send_message_streaming_with_sender_context_and_routing(
-        self: &Arc<Self>,
-        agent_id: AgentId,
-        message: &str,
-        kernel_handle: Option<Arc<dyn KernelHandle>>,
-        sender: &SenderContext,
-    ) -> KernelResult<(
-        tokio::sync::mpsc::Receiver<StreamEvent>,
-        tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
-    )> {
-        let handle = kernel_handle.unwrap_or_else(|| self.kernel_handle());
-        self.send_message_streaming_resolved(agent_id, message, handle, Some(sender), None, None)
-            .await
     }
 
     /// Streaming entry point with per-call deep-thinking override.
@@ -1800,7 +1817,10 @@ impl LibreFangKernel {
             message,
             handle,
             Some(sender),
-            thinking_override,
+            // The channel `/think` toggle is a boolean by construction (#7140);
+            // #7946's richer modes reach the kernel through the HTTP message
+            // routes, not through this entry point.
+            thinking_override.into(),
             None,
         )
         .await
@@ -1830,7 +1850,9 @@ impl LibreFangKernel {
             message,
             handle,
             Some(sender),
-            thinking_override,
+            // Boolean for the same reason as the sibling entry above: the
+            // WebSocket / channel deep-thinking toggle is on/off.
+            thinking_override.into(),
             session_id_override,
         )
         .await
@@ -1854,7 +1876,13 @@ impl LibreFangKernel {
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
     )> {
         let handle = kernel_handle.unwrap_or_else(|| self.kernel_handle());
-        self.send_message_streaming_with_sender(agent_id, message, handle, None, None)
+        self.send_message_streaming_with_sender(
+            agent_id,
+            message,
+            handle,
+            None,
+            librefang_types::config::ThinkingOverride::Inherit,
+        )
     }
 
     /// Run a *derivative* (forked) turn for an agent using the canonical
@@ -1935,6 +1963,7 @@ impl LibreFangKernel {
             interrupt: Some(interrupt),
             max_iterations: self.config.load().agent_max_iterations,
             max_history_messages: self.config.load().max_history_messages,
+            memory_fact_budget_percent: self.config.load().memory_fact_budget_percent,
             aux_client: Some(self.llm.aux_client.load_full()),
             parent_session_id: Some(parent_session_id),
             tool_results_config: Some(self.config.load().tool_results.clone()),
@@ -1958,6 +1987,12 @@ impl LibreFangKernel {
             // cron / autonomous channel carve-out for a path that has no
             // synthetic channel to match on.
             system_call: true,
+            // #7744: a fork must not inherit the parent turn's human. Left
+            // `None` here and re-resolved fork-aware in
+            // `send_message_streaming_with_sender_and_opts`, so what a fork
+            // creates is recorded against the agent's configured owner or
+            // nothing — never against the person whose turn spawned it.
+            acting_principal: None,
         };
         // INVARIANT: forks must use the canonical session so the parent turn's
         // prompt-cache prefix is reused. Do NOT pass a `session_id_override`
@@ -1969,7 +2004,7 @@ impl LibreFangKernel {
             fork_prompt,
             self.kernel_handle(),
             None, // no sender context — fork uses the canonical session
-            None, // no thinking override
+            librefang_types::config::ThinkingOverride::Inherit, // no per-call override
             None, // forks MUST stay on canonical — see invariant above
             loop_opts,
             None, // fork must not inherit the parent turn's owner (#6460)
@@ -1982,7 +2017,7 @@ impl LibreFangKernel {
         message: &str,
         kernel_handle: Arc<dyn KernelHandle>,
         sender_context: Option<&SenderContext>,
-        thinking_override: Option<bool>,
+        thinking_override: librefang_types::config::ThinkingOverride,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
@@ -2003,7 +2038,7 @@ impl LibreFangKernel {
         message: &str,
         kernel_handle: Arc<dyn KernelHandle>,
         sender_context: Option<&SenderContext>,
-        thinking_override: Option<bool>,
+        thinking_override: librefang_types::config::ThinkingOverride,
         session_id_override: Option<SessionId>,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
@@ -2030,6 +2065,7 @@ impl LibreFangKernel {
             interrupt: Some(session_interrupt),
             max_iterations: self.config.load().agent_max_iterations,
             max_history_messages: self.config.load().max_history_messages,
+            memory_fact_budget_percent: self.config.load().memory_fact_budget_percent,
             aux_client: Some(self.llm.aux_client.load_full()),
             parent_session_id: None,
             tool_results_config: Some(self.config.load().tool_results.clone()),
@@ -2041,6 +2077,10 @@ impl LibreFangKernel {
             canvas_config: Some(self.config.load().canvas.clone()),
             // User-initiated main turn, not a system-internal fork.
             system_call: false,
+            // #7744: resolved in `send_message_streaming_with_sender_and_opts`,
+            // the first point where this agent's manifest is in hand — the
+            // same place `compaction_config` above is filled in.
+            acting_principal: None,
         };
         self.send_message_streaming_with_sender_and_opts(
             agent_id,
@@ -2067,7 +2107,7 @@ impl LibreFangKernel {
         message: &str,
         kernel_handle: Arc<dyn KernelHandle>,
         sender_context: Option<&SenderContext>,
-        thinking_override: Option<bool>,
+        thinking_override: librefang_types::config::ThinkingOverride,
         session_id_override: Option<SessionId>,
         mut loop_opts: librefang_runtime::agent_loop::LoopOptions,
         owner: Option<librefang_types::agent::UserId>,
@@ -2096,6 +2136,25 @@ impl LibreFangKernel {
                 _ => cfg.compaction.clone(),
             };
             loop_opts.compaction_config = Some(merged);
+        }
+
+        // #7744: resolve the principal this turn acts for, here rather than at
+        // the five call sites that build `LoopOptions`, for the same reason
+        // `compaction_config` is resolved here — this is the first point where
+        // the manifest is in hand. A caller that already populated the field
+        // wins.
+        //
+        // The fork clause mirrors `effective_owner` below: a fork must not
+        // inherit the parent turn's human, so what a fork creates is recorded
+        // against the agent's configured owner or nothing, never against the
+        // person whose turn spawned it.
+        if loop_opts.acting_principal.is_none() {
+            let turn_owner = if loop_opts.is_fork { None } else { owner };
+            loop_opts.acting_principal = librefang_types::principal::resolve_acting_principal(
+                turn_owner,
+                entry.manifest.owner.as_deref(),
+                cfg.default_owner_principal(),
+            );
         }
 
         // #4807: the pre-dispatch provider-budget gate was removed
@@ -2462,15 +2521,17 @@ impl LibreFangKernel {
             });
         }
 
-        // Resolve the context window: agent.toml override > catalog > session
-        // (#6568). Computed *after* the session model override is applied — the
-        // pre-#6568 code read `entry.manifest`, so a `/model` switch sized the
-        // budget from the manifest's original model.
+        // Resolve the context window: agent.toml override > per-model operator
+        // override > catalog > session (#6568, #7774). Computed *after* the
+        // session model override is applied — the pre-#6568 code read
+        // `entry.manifest`, so a `/model` switch sized the budget from the
+        // manifest's original model.
         let ctx_window = super::manifest_helpers::resolve_context_window(
             &self.llm.model_catalog.load(),
             &manifest.model,
             Some(session.context_window_tokens),
-        );
+        )
+        .map(|resolved| resolved.tokens);
 
         // Inject model_supports_tools for auto web search augmentation.
         // Refs #4745: honour user capability overrides via effective_capabilities.
@@ -2812,6 +2873,10 @@ impl LibreFangKernel {
         // Use `effective_owner` (already null for forks, computed above) NOT the raw owner, so a sub-agent's spend is not mis-attributed to the parent turn's user.
         // Snapshot into a Copy local before the spawn moves it into the task.
         let billed_user_id: Option<UserId> = effective_owner.or(attribution_user_id);
+        // #7714: resolved here, before the spawn, so the async block moves a
+        // plain `AgentId` instead of borrowing the registry entry across the
+        // task boundary. Mirrors how `billed_user_id` is captured above.
+        let billed_agent_id = crate::kernel::agent_execution::billed_agent_for(&entry);
 
         // `loop_opts` is already a local — the spawned async move will
         // capture it. Agent loop reads these at each turn-end / save /
@@ -3008,11 +3073,15 @@ impl LibreFangKernel {
                 .unwrap_or_else(|e| e.into_inner())
                 .snapshot();
 
-            // Load workspace-scoped skills (override global skills with same name)
+            // Load workspace-scoped skills (override global skills with same name).
+            // See the non-streaming path in `agent_execution.rs` for why there is no `.exists()` guard and why a frozen registry is debug rather than warn (#7964).
             if let Some(ref workspace) = manifest.workspace {
-                let ws_skills = workspace.join("skills");
-                if ws_skills.exists() {
-                    if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
+                match skill_snapshot.load_workspace_skills(&workspace.join("skills")) {
+                    Ok(_) => {}
+                    Err(SkillError::RegistryFrozen(detail)) => {
+                        tracing::debug!(agent_id = %agent_id, "Stable mode (streaming): {detail}");
+                    }
+                    Err(e) => {
                         warn!(agent_id = %agent_id, "Failed to load workspace skills (streaming): {e}");
                     }
                 }
@@ -3216,6 +3285,8 @@ impl LibreFangKernel {
                         user_id: billed_user_id,
                         channel: attribution_channel.clone(),
                         session_id: Some(effective_session_id),
+                        // #7714: same rollup as the non-streaming path.
+                        billed_agent_id: Some(billed_agent_id),
                     };
                     if let Err(e) = kernel_clone.metering.engine.check_all_and_record(
                         &usage_record,

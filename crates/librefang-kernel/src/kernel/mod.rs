@@ -58,6 +58,34 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, error, info, instrument, warn};
 
+fn read_config_override<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+    state: &'static str,
+) -> std::sync::RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        warn!(
+            state,
+            "kernel config override read lock poisoned; recovering inner state"
+        );
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+fn write_config_override<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+    state: &'static str,
+) -> std::sync::RwLockWriteGuard<'a, T> {
+    lock.write().unwrap_or_else(|poisoned| {
+        warn!(
+            state,
+            "kernel config override write lock poisoned; recovering inner state"
+        );
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 /// Per-trait `kernel_handle::*` impls live in their own files under
 /// `kernel/handles/` to keep this file from doubling as a trait-impl
 /// dumping ground. The submodules are descendants of `kernel`, so they
@@ -96,23 +124,27 @@ mod cron_script;
 // this file (#4683 landing zone). Extracted as `pub(super) async fn`
 // so the body can be edited and reviewed in isolation.
 mod cron_tick;
+mod ephemeral_spawn;
 mod goal_lifecycle;
 mod hands_lifecycle;
 mod llm_drivers;
 mod mcp_setup;
 mod mcp_summary;
 mod messaging;
+pub mod mission_workspace;
 mod pooled_driver;
 mod prompt_context;
 mod provider_probe;
+mod provisioning_ops;
 mod reviewer_sanitize;
 mod session_ops;
 mod spawn;
+pub mod step_agent;
 mod subsystem_forwards;
 pub mod subsystems;
 mod task_registry;
 mod tools_and_skills;
-pub use tools_and_skills::SkillReloadOutcome;
+pub use tools_and_skills::{PendingSkillMcpDeclarations, SemanticMemoryAccess, SkillReloadOutcome};
 mod triggers_and_workflow;
 
 // `cron_deliver_response`, `cron_fan_out_targets`, and `cron_script_wake_gate`
@@ -784,8 +816,18 @@ pub(crate) struct RunningTask {
 pub struct LibreFangKernel {
     /// Boot-time home directory (immutable — cannot hot-reload).
     home_dir_boot: PathBuf,
+    /// Absolute path of the `config.toml` this kernel was booted from (immutable — cannot hot-reload).
+    ///
+    /// Resolved exactly once, in `boot` / `boot_with_config`, and read by every surface that re-reads or persists the configuration — hot-reload, the mtime watcher, and every API route that writes into the file (#6695).
+    /// Deriving it a second time from `home_dir_boot` is what let the daemon load `LIBREFANG_CONFIG_PATH` and then write somewhere else.
+    config_path_boot: PathBuf,
     /// Boot-time data directory (immutable — cannot hot-reload).
     data_dir_boot: PathBuf,
+    /// What the deployment's provisioning tree currently owns (#6695).
+    ///
+    /// Swapped wholesale by [`Self::apply_provisioning`] so a reader never observes a half-applied plan, and read on every resource write guard — which is why it is an `ArcSwap` rather than a lock.
+    /// Empty and disabled unless `LIBREFANG_PROVISIONING_PATH` is set, which is every installation that has not opted in.
+    pub(crate) provisioning: ArcSwap<crate::provisioning::ProvisioningRuntime>,
     /// Kernel configuration (atomically swappable for hot-reload).
     pub(crate) config: ArcSwap<KernelConfig>,
     /// Cached raw `config.toml` value used for skill config-var injection.
@@ -1370,24 +1412,39 @@ impl LibreFangKernel {
             buttons,
         };
 
-        if let Some(adapter) = self.mesh.channel_adapters.get(&target.channel_type) {
-            let user = librefang_channels::types::ChannelUser {
-                platform_id: target.recipient.clone(),
-                display_name: target.recipient.clone(),
-                librefang_user: None,
-            };
-            if let Err(e) = adapter.send_interactive(&user, &interactive).await {
-                warn!(
+        // Resolve through the same helper every outbound send uses (#8055).
+        // `NotificationTarget.channel_type` is a channel *type* (`"slack"`) while the bridge keys the registry by instance `name` (`"slack-hr"`), so the bare `channel_adapters.get(&target.channel_type)` that used to sit here missed on every named instance and dropped straight to the plain-text fallback below — silently costing the approver the Approve / Reject buttons on the one notification whose entire point is those buttons.
+        // Resolving to an owned `Arc` also stops a `DashMap` shard guard from being held across the `send_interactive` await.
+        match handles::channel_sender::resolve_channel_adapter(
+            &self.mesh.channel_adapters,
+            &target.channel_type,
+            None,
+        ) {
+            Ok(adapter) => {
+                let user = librefang_channels::types::ChannelUser {
+                    platform_id: target.recipient.clone(),
+                    display_name: target.recipient.clone(),
+                    librefang_user: None,
+                };
+                if let Err(e) = adapter.send_interactive(&user, &interactive).await {
+                    warn!(
+                        channel = %target.channel_type,
+                        error = %e,
+                        "Failed to send interactive approval notification, falling back to text"
+                    );
+                    // Fallback to plain text
+                    self.push_to_target(target, &display_message).await;
+                }
+            }
+            Err(e) => {
+                // No adapter resolved — fall back to send_channel_message, which reports its own failure.
+                debug!(
                     channel = %target.channel_type,
                     error = %e,
-                    "Failed to send interactive approval notification, falling back to text"
+                    "No adapter resolved for interactive approval notification, falling back to text"
                 );
-                // Fallback to plain text
                 self.push_to_target(target, &display_message).await;
             }
-        } else {
-            // No adapter found — fall back to send_channel_message
-            self.push_to_target(target, &display_message).await;
         }
     }
 
@@ -1836,22 +1893,16 @@ impl LibreFangKernel {
             );
             return;
         }
-        // Route the reply through the canonical account-qualified outbound
-        // path (#6492 Bug 2). `send_channel_message` builds the adapter
-        // lookup key as `"<channel>:<account_id>"` when an account is present
-        // and falls back to the bare `<channel>` otherwise — matching how the
-        // channel bridge registers adapters under BOTH keys for multi-account
-        // installs. The previous bare `channel_adapters.get(channel)` ignored
-        // `deferred.account_id`, so on a multi-account daemon a post-approval
-        // reply for a non-first account was delivered to the wrong account's
-        // adapter (wrong bot/chat) or missed entirely. Reusing the canonical
-        // path also picks up the adapter's `output_format` override for free,
-        // exactly as a normal inbound reply would. `thread_id: None` — the wake
-        // path carries no thread context (mirrors the pre-fix `adapter.send()`,
-        // which never threaded). On an adapter-miss OR a send failure the call
-        // returns `Err`; we log WARN (it does not log itself) with the same
-        // information as before — the reply is still persisted in session
-        // history, so the next user turn surfaces it.
+        // Route the reply through the canonical account-qualified outbound path (#6492 Bug 2).
+        // `send_channel_message` delegates to `handles::channel_sender::resolve_channel_adapter`, whose precedence rules are documented there.
+        // The previous bare `channel_adapters.get(channel)` ignored `deferred.account_id`, so on a multi-account daemon a post-approval reply for a non-first account was delivered to the wrong account's adapter (wrong bot/chat) or missed entirely.
+        //
+        // `channel` here is the *channel type* the inbound turn was stamped with (`librefang_channels::bridge` uses `channel_type_str(adapter.channel_type())`), while the bridge keys the adapter registry by instance `name`.
+        // Resolving the two against each other is what #8055 fixed; keep that in mind before reintroducing any direct `channel_adapters` lookup on this path.
+        //
+        // Reusing the canonical path also picks up the adapter's `output_format` override for free, exactly as a normal inbound reply would.
+        // `thread_id: None` — the wake path carries no thread context (mirrors the pre-fix `adapter.send()`, which never threaded).
+        // On an adapter-miss OR a send failure the call returns `Err`; we log WARN (it does not log itself) — the reply is still persisted in session history, so the next user turn surfaces it.
         if let Err(e) = self
             .send_channel_message(
                 channel,
@@ -1936,6 +1987,32 @@ impl LibreFangKernel {
             // originating session's checker is no longer live — skip the
             // session-scoped dangerous-command check here.
             dangerous_command_checker: None,
+            // #7744: deliberately `None`, and this is the one decision the
+            // issue thread left genuinely open, so it is recorded here rather
+            // than in a commit message.
+            //
+            // `DeferredToolExecution` is persisted. A principal written into
+            // it would be resolved at *defer* time and consumed at *resume*
+            // time — possibly after a restart, a config reload, or the
+            // deletion of the user it names — so it would be an assertion
+            // about the past presented as a live one. That is the same failure
+            // mode as stamping an unauthenticated sender: it looks
+            // authoritative and is not.
+            //
+            // The three candidate answers are (a) stamp it and accept the
+            // staleness, (b) re-resolve at resume and fail closed if the
+            // principal is gone, (c) refuse to defer a tool call that needs an
+            // owner. Choosing between them needs the enforcement semantics
+            // that this increment deliberately does not have yet — with
+            // nothing reading the owner, all three are indistinguishable — so
+            // the conservative one is taken and the choice is left to the PR
+            // that makes ownership restrict something.
+            //
+            // Concretely: a `workflow_create` or `cron_create` that goes
+            // through the approval gate is recorded unowned. That is a real
+            // gap, and it is narrower than the alternative of recording an
+            // owner nobody re-verified.
+            acting_principal: None,
         }
     }
 

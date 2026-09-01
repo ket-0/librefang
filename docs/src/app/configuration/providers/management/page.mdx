@@ -63,6 +63,8 @@ discover_models = true
 ```
 
 An opted-in provider joins the same paths a built-in local one already walks: the periodic probe loop, the `POST /api/providers/{name}/test` refresh (whose response then reports `discovered_models`), and the live-model filter applied to `GET /api/models`.
+`GET /api/models` queries the listing itself as well, through the same 60-second probe cache that backs the Dashboard's provider grid, so the models a gateway serves are in the list on the very first request instead of only once a background probe tick has happened to land.
+A listing that cannot be fetched is not an error: the response falls back to the checked-in catalog and the reason is logged at `debug` level, so a gateway that proxies `/chat/completions` without exposing `/models` behaves exactly as it did before you turned the flag on.
 The flag never turns discovery *off* for the built-in ids — those are decided by the id, not by the flag — so an existing install is unaffected.
 
 The Dashboard exposes the same switch as **Auto-discover models** in the Add Provider wizard and in a provider's Configure drawer; the latter calls `PUT /api/providers/{name}/discovery` with `{"discover_models": true}`, which writes the value back into the provider's own TOML.
@@ -271,6 +273,44 @@ When `pinned_model` is set on an agent manifest, that agent always uses the spec
 
 ---
 
+## Per-Model Configuration Overrides
+
+A model's own configuration — including its **context window** — is editable at any time, not only when the model is first registered.
+Overrides are keyed by `provider:model_id` and stored in `~/.librefang/data/model_overrides.json`, separately from the catalog entry, so a registry sync that rewrites the entry leaves them intact.
+
+```
+GET    /api/models/overrides/{provider}:{model_id}
+PUT    /api/models/overrides/{provider}:{model_id}
+DELETE /api/models/overrides/{provider}:{model_id}
+```
+
+`PUT` takes the whole document, not a patch — a field omitted from the body is cleared.
+
+```json
+{
+  "context_window": 16384,
+  "max_output_tokens": 4096,
+  "temperature": 0.3
+}
+```
+
+The two capacity limits answer a different question from the inference parameters next to them.
+`context_window` and `max_output_tokens` correct what the model *is* — facts a gateway in front of a self-hosted runtime routinely reports as `null` — while `max_tokens` is the per-request output cap sent on the wire.
+Setting the output cap to the model's window asks the model to reserve its entire context for the reply, which is the confusion these fields exist to end.
+
+### Context window precedence
+
+1. `agent.toml` — `[model] context_window`, the most specific layer: one agent stating its own window.
+2. `model_overrides.json` — `context_window`, the operator's correction for the model, inherited by every agent that uses it.
+3. The catalog entry — whatever the registry declared, or a live `/models` discovery pass assumed.
+4. `8192` — the conservative fallback the agent loop applies when nothing above resolves, with a `WARN` naming the value it assumed.
+
+A zero is treated as "unknown" at every layer, never as a limit, so clearing a field falls through to the next layer instead of pinning the window to zero tokens.
+
+`GET /api/models` and `GET /api/models/{id}` report the **effective** `context_window` / `max_output_tokens`, with the raw catalog values preserved under `limits_catalog` so a revert-to-default control has a target to name.
+
+---
+
 ## Model Routing
 
 LibreFang can automatically select the cheapest model capable of handling each query. This is configured per-agent via `ModelRoutingConfig`.
@@ -286,10 +326,12 @@ LibreFang can automatically select the cheapest model capable of handling each q
 | Signal | Weight | Logic |
 |--------|--------|-------|
 | Total message length | 1 point per ~4 chars | Rough token proxy |
-| Tool availability | +20 per tool defined | Tools imply multi-step work |
 | Code markers | +30 per marker found | Backticks, `fn`, `def`, `class`, `import`, `function`, `async`, `await`, `struct`, `impl`, `return` |
 | Conversation depth | +15 per message > 10 | Deep context = harder reasoning |
-| System prompt length | +1 per 10 chars > 500 | Long system prompts imply complex tasks |
+
+Every signal is a property of the request. Tool count and system-prompt length were scored until #7952 and are not any more: they are the same on every turn of a given agent, so they shifted the whole distribution instead of separating easy turns from hard ones.
+An agent with ~50 MCP tools scored +1000 from tool count before a single character of the message was read, past any usable `complex_threshold`, so routing degenerated into pinned-complex and saved nothing.
+If your agent's turns now score lower than they used to, lower `simple_threshold` / `complex_threshold` — the scores are no longer inflated by a constant.
 
 ### Thresholds
 

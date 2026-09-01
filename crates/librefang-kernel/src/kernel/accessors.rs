@@ -38,6 +38,7 @@ fn read_accessor_state<'a, T>(
             state,
             "kernel accessor read lock poisoned; recovering inner state"
         );
+        lock.clear_poison();
         poisoned.into_inner()
     })
 }
@@ -51,6 +52,7 @@ fn write_accessor_state<'a, T>(
             state,
             "kernel accessor write lock poisoned; recovering inner state"
         );
+        lock.clear_poison();
         poisoned.into_inner()
     })
 }
@@ -64,6 +66,7 @@ fn lock_accessor_state<'a, T>(
             state,
             "kernel accessor lock poisoned; recovering inner state"
         );
+        lock.clear_poison();
         poisoned.into_inner()
     })
 }
@@ -104,6 +107,15 @@ impl LibreFangKernel {
     #[inline]
     pub fn home_dir(&self) -> &Path {
         &self.home_dir_boot
+    }
+
+    /// Path of the `config.toml` this daemon loaded (boot-time immutable).
+    ///
+    /// The one answer to "which file is the configuration", for hot-reload, the change watcher, the managed-mode `423` body, and every route that persists into it.
+    /// Do not reconstruct it as `home_dir().join("config.toml")`: that expression disagrees with the loader whenever `LIBREFANG_CONFIG_PATH` is set, whenever the daemon was started with `--config`, and whenever the loaded file sets its own `home_dir` (#6695).
+    #[inline]
+    pub fn config_path(&self) -> &Path {
+        &self.config_path_boot
     }
 
     /// Snapshot the inbox subsystem's status (config + on-disk file counts).
@@ -294,7 +306,7 @@ impl LibreFangKernel {
         &self,
         agent_workspace: Option<&std::path::Path>,
     ) -> Option<tokio::sync::Mutex<Vec<librefang_runtime::mcp::McpConnection>>> {
-        use librefang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
+        use librefang_runtime::mcp::{McpServerConfig, McpTransport};
         use librefang_types::config::McpTransportEntry;
 
         let servers = self
@@ -394,7 +406,12 @@ impl LibreFangKernel {
                 roots: server_roots,
             };
 
-            match McpConnection::connect(mcp_config).await {
+            // Through the wiring helper, not a bare `connect` (#7963): these connections
+            // serve the same agent tool calls the daemon-global pool does, so a transport
+            // wedge observed on one has to reach the health monitor too. A bare connect
+            // compiles and dispatches fine while silently reporting nothing, which is
+            // exactly the invisible hole #7963 was.
+            match self.connect_mcp_wired(mcp_config).await {
                 Ok(conn) => connections.push(conn),
                 Err(e) => warn!(
                     server = %server_config.name,
@@ -1305,6 +1322,22 @@ impl LibreFangKernel {
             }
         }
 
+        // 2. agent_watchers — completed background tasks no longer need to be retained just so a future kill_agent can abort them.
+        // Registration also performs this cleanup opportunistically, but an agent that starts only one watcher would otherwise retain its finished JoinHandle for the rest of the daemon lifetime.
+        for slot in self.agents.agent_watchers.iter() {
+            match slot.value().lock() {
+                Ok(mut handles) => {
+                    let before = handles.len();
+                    handles.retain(|handle| !handle.is_finished());
+                    total_removed += before - handles.len();
+                }
+                Err(_) => warn!(
+                    agent_id = %slot.key(),
+                    "Agent watcher lock poisoned during GC; leaving handles for a later sweep"
+                ),
+            }
+        }
+
         // 3. agent_msg_locks — remove locks for dead agents, but only when the
         // map slot is the sole remaining holder of the Arc (`Arc::strong_count
         // == 1`). This mirrors the session_msg_locks pass below. The dead-agent
@@ -1593,11 +1626,25 @@ mod tests {
                 .join()
         });
         assert!(rw_poison.is_err());
+        assert!(rw_state.is_poisoned());
         assert_eq!(
             &*read_accessor_state(&rw_state, "test_state"),
             &["loaded", "stale"]
         );
+        assert!(!rw_state.is_poisoned());
+
+        let rw_poison = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _state = rw_state.write().unwrap();
+                    panic!("poison accessor rwlock before write recovery");
+                })
+                .join()
+        });
+        assert!(rw_poison.is_err());
+        assert!(rw_state.is_poisoned());
         write_accessor_state(&rw_state, "test_state").clear();
+        assert!(!rw_state.is_poisoned());
         assert!(read_accessor_state(&rw_state, "test_state").is_empty());
 
         let mutex_state = std::sync::Mutex::new(vec!["cached"]);
@@ -1610,7 +1657,9 @@ mod tests {
                 .join()
         });
         assert!(mutex_poison.is_err());
+        assert!(mutex_state.is_poisoned());
         lock_accessor_state(&mutex_state, "test_state").clear();
+        assert!(!mutex_state.is_poisoned());
         assert!(lock_accessor_state(&mutex_state, "test_state").is_empty());
     }
 
@@ -1672,6 +1721,7 @@ mod tests {
             .spawn_agent_inner(
                 AgentManifest {
                     name: "atomic-resolver-test-agent".to_string(),
+                    source_template: None,
                     description: "persistent + cap=4 forces the clamp branch".to_string(),
                     author: "test".to_string(),
                     module: "builtin:chat".to_string(),
